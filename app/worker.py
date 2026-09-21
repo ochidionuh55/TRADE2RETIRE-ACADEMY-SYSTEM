@@ -14,9 +14,23 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from app.bootstrap import create_schema
 from app.db import session_scope
 from app.logging import configure_logging, get_logger
+from app.org import seed_org
 from app.services import detect_missed_and_intervene, sweep_overdue
 
 logger = get_logger(__name__)
+
+
+async def ensure_org() -> None:
+    """Seed the organisation on boot. Idempotent, and never fatal: a seeding
+    failure is logged and the worker still runs its loop."""
+    try:
+        async with session_scope() as s:
+            summary = await seed_org(s)
+        logger.info("org.seeded", **summary)
+    except Exception as exc:
+        # Fail-safe but LOUD: the worker keeps running, but a seeding failure is
+        # emitted as error-level telemetry so it surfaces, never disappears.
+        logger.error("org.seed_failed", error=str(exc), exc_info=True)
 
 
 async def daily_pass() -> None:
@@ -30,6 +44,7 @@ async def daily_pass() -> None:
 async def main() -> None:
     configure_logging()
     await create_schema()
+    await ensure_org()
     # Run once on boot so a fresh deploy is immediately current.
     await daily_pass()
     scheduler = AsyncIOScheduler(timezone="UTC")

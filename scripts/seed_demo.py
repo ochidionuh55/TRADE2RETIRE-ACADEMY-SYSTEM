@@ -32,7 +32,11 @@ async def main() -> int:
     await create_schema()
     settings = get_settings()
     async with session_scope() as s:
-        cohort = Cohort(name="Cohort A — The Architect", programme="The Architect")
+        # is_demo=True keeps every one of these records out of production
+        # aggregates by invariant (see services.weekly_brief).
+        cohort = Cohort(
+            name="Cohort A — The Architect", programme="The Architect", is_demo=True
+        )
         s.add(cohort)
         await s.flush()
 
@@ -53,7 +57,7 @@ async def main() -> int:
 
         three_weeks_ago = datetime.now(UTC) - timedelta(weeks=3)
         for name in ("Demo Student One", "Demo Student Two", "Demo Student Three"):
-            person = Person(full_name=name)
+            person = Person(full_name=name, is_demo=True)
             s.add(person)
             await s.flush()
             enr = Enrolment(

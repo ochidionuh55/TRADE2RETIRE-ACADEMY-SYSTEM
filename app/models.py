@@ -33,10 +33,13 @@ class Person(IdMixin, TimestampMixin, Base):
     __tablename__ = "person"
     __table_args__ = (Index("ix_person_telegram", "telegram_id"),)
 
+    # BigInteger: Telegram user ids exceed the 32-bit signed range.
     telegram_id: Mapped[int | None] = mapped_column(BigInteger, unique=True)
     full_name: Mapped[str] = mapped_column(String(160), nullable=False, default="")
     phone: Mapped[str | None] = mapped_column(String(40))
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Demo records are isolated from every production aggregate by invariant.
+    is_demo: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
 
 class RoleAssignment(IdMixin, TimestampMixin, Base):
@@ -59,6 +62,7 @@ class Cohort(IdMixin, TimestampMixin, Base):
     programme: Mapped[str] = mapped_column(String(80), nullable=False, default="")
     started_on: Mapped[date | None] = mapped_column(Date)
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    is_demo: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
 
 class Enrolment(IdMixin, TimestampMixin, Base):
@@ -148,6 +152,73 @@ class Intervention(IdMixin, TimestampMixin, Base):
     due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     outcome: Mapped[str | None] = mapped_column(Text)
+
+
+# ── Organisation model (Increment 2) ─────────────────────────────────────────
+# Departments, staff profiles, reporting lines and schedules. All are
+# data/config-driven (see app.org): the engine only ever asks about roles and
+# these records, never about a person by name.
+
+
+class Department(IdMixin, TimestampMixin, Base):
+    """A unit of the company. Seeded from config; extendable by an admin."""
+
+    __tablename__ = "department"
+
+    code: Mapped[str] = mapped_column(String(32), nullable=False, unique=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+
+class StaffProfile(IdMixin, TimestampMixin, Base):
+    """Staff-side attributes for a canonical Person. One per staff member."""
+
+    __tablename__ = "staff_profile"
+    __table_args__ = (UniqueConstraint("person_id", name="uq_staff_person"),)
+
+    person_id: Mapped[int] = mapped_column(ForeignKey("person.id"), nullable=False)
+    department_id: Mapped[int | None] = mapped_column(ForeignKey("department.id"))
+    title: Mapped[str] = mapped_column(String(120), nullable=False, default="")
+    # employment_type: OFFICE / REMOTE / HYBRID etc. — attendance policy hangs
+    # off this later. TODO(founder): confirm each person's arrangement.
+    employment_type: Mapped[str] = mapped_column(String(24), nullable=False, default="office")
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    is_demo: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+
+class ReportingLine(IdMixin, TimestampMixin, Base):
+    """Who a person reports to. One current manager per person.
+
+    ``confirmed`` stays False until a founder approves the relationship — the
+    system supports it structurally but never *infers* an unconfirmed line.
+    """
+
+    __tablename__ = "reporting_line"
+    __table_args__ = (UniqueConstraint("person_id", name="uq_reporting_person"),)
+
+    person_id: Mapped[int] = mapped_column(ForeignKey("person.id"), nullable=False)
+    manager_id: Mapped[int] = mapped_column(ForeignKey("person.id"), nullable=False)
+    confirmed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+
+class WorkSchedule(IdMixin, TimestampMixin, Base):
+    """Expected working pattern — the baseline "who was expected" comes from here.
+
+    Defaults are sensible placeholders; ``confirmed`` stays False until a
+    founder signs off the real schedule, and attendance logic treats an
+    unconfirmed schedule as advisory only.
+    """
+
+    __tablename__ = "work_schedule"
+    __table_args__ = (UniqueConstraint("person_id", name="uq_schedule_person"),)
+
+    person_id: Mapped[int] = mapped_column(ForeignKey("person.id"), nullable=False)
+    timezone: Mapped[str] = mapped_column(String(48), nullable=False, default="Africa/Lagos")
+    # ISO weekday numbers expected in office, Monday=1 … Sunday=7.
+    workdays: Mapped[str] = mapped_column(String(16), nullable=False, default="1,2,3,4,5")
+    start_local: Mapped[str] = mapped_column(String(5), nullable=False, default="09:00")
+    end_local: Mapped[str] = mapped_column(String(5), nullable=False, default="17:00")
+    confirmed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
 
 # Open, un-completed states an intervention can sit in.

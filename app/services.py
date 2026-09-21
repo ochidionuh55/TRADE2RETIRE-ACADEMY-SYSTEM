@@ -290,34 +290,41 @@ async def weekly_brief(session: AsyncSession, now: datetime | None = None) -> di
     moment = now or datetime.now(UTC)
     week = current_week_ending(moment)
 
+    # Demo-data isolation invariant: every figure below joins Person and
+    # excludes is_demo rows, so seeded demo entities can never enter a
+    # production aggregate (Increment 2, §17).
     active_students = (
         await session.execute(
-            select(func.count(func.distinct(Enrolment.person_id))).where(
-                Enrolment.status == "active"
-            )
+            select(func.count(func.distinct(Enrolment.person_id)))
+            .select_from(Enrolment)
+            .join(Person, Person.id == Enrolment.person_id)
+            .where(Enrolment.status == "active", Person.is_demo.is_(False))
         )
     ).scalar_one()
 
     submitted = (
         await session.execute(
-            select(func.count()).select_from(FridayReport).where(
-                FridayReport.week_ending == week
-            )
+            select(func.count())
+            .select_from(FridayReport)
+            .join(Person, Person.id == FridayReport.person_id)
+            .where(FridayReport.week_ending == week, Person.is_demo.is_(False))
         )
     ).scalar_one()
 
     open_interventions = (
         await session.execute(
-            select(func.count()).select_from(Intervention).where(
-                Intervention.status == "open"
-            )
+            select(func.count())
+            .select_from(Intervention)
+            .join(Person, Person.id == Intervention.subject_person_id)
+            .where(Intervention.status == "open", Person.is_demo.is_(False))
         )
     ).scalar_one()
     overdue_interventions = (
         await session.execute(
-            select(func.count()).select_from(Intervention).where(
-                Intervention.status == "overdue"
-            )
+            select(func.count())
+            .select_from(Intervention)
+            .join(Person, Person.id == Intervention.subject_person_id)
+            .where(Intervention.status == "overdue", Person.is_demo.is_(False))
         )
     ).scalar_one()
 
@@ -326,8 +333,11 @@ async def weekly_brief(session: AsyncSession, now: datetime | None = None) -> di
     reported_ids = set(
         (
             await session.execute(
-                select(FridayReport.person_id.distinct()).where(
-                    FridayReport.week_ending.in_(dormant_weeks)
+                select(FridayReport.person_id.distinct())
+                .join(Person, Person.id == FridayReport.person_id)
+                .where(
+                    FridayReport.week_ending.in_(dormant_weeks),
+                    Person.is_demo.is_(False),
                 )
             )
         ).scalars().all()
@@ -335,7 +345,9 @@ async def weekly_brief(session: AsyncSession, now: datetime | None = None) -> di
     all_active_ids = set(
         (
             await session.execute(
-                select(Enrolment.person_id.distinct()).where(Enrolment.status == "active")
+                select(Enrolment.person_id.distinct())
+                .join(Person, Person.id == Enrolment.person_id)
+                .where(Enrolment.status == "active", Person.is_demo.is_(False))
             )
         ).scalars().all()
     )
