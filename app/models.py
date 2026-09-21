@@ -12,6 +12,7 @@ from datetime import date, datetime
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     Date,
     DateTime,
@@ -32,7 +33,7 @@ class Person(IdMixin, TimestampMixin, Base):
     __tablename__ = "person"
     __table_args__ = (Index("ix_person_telegram", "telegram_id"),)
 
-    telegram_id: Mapped[int | None] = mapped_column(unique=True)
+    telegram_id: Mapped[int | None] = mapped_column(BigInteger, unique=True)
     full_name: Mapped[str] = mapped_column(String(160), nullable=False, default="")
     phone: Mapped[str | None] = mapped_column(String(40))
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
