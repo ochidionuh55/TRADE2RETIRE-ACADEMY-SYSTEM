@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -38,6 +38,22 @@ class Settings(BaseSettings):
     )
     academy_name: str = Field(default="Trade2Retire Academy")
     timezone: str = Field(default="Africa/Lagos")
+
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def _async_dsn(cls, value: object) -> object:
+        """Accept Railway's plain ``postgresql://`` and use the async driver.
+
+        Railway hands out ``postgres://…`` / ``postgresql://…``; SQLAlchemy's
+        async engine needs ``postgresql+asyncpg://…``. Normalising here means
+        ``T2R__DATABASE_URL`` can be set to Railway's own reference verbatim.
+        """
+        if isinstance(value, str):
+            if value.startswith("postgres://"):
+                return "postgresql+asyncpg://" + value[len("postgres://"):]
+            if value.startswith("postgresql://"):
+                return "postgresql+asyncpg://" + value[len("postgresql://"):]
+        return value
 
     @property
     def admin_id_set(self) -> set[int]:
