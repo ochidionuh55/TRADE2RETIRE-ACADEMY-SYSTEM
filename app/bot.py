@@ -13,7 +13,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message
+from aiogram.types import BotCommand, Message
 from sqlalchemy import select
 
 from app.config import PROCESS, get_settings
@@ -224,6 +224,27 @@ async def review(message: Message) -> None:
     await message.answer("✅ Review recorded.")
 
 
+# The command menu shown when a user types "/". Access is still enforced
+# server-side per handler; this list is only the visible affordance.
+_MENU: list[BotCommand] = [
+    BotCommand(command="start", description="🏠 Home — your menu"),
+    BotCommand(command="me", description="👤 Your record and roles"),
+    BotCommand(command="friday", description="📝 Submit this week's trading review"),
+    BotCommand(command="queue", description="🚨 Mentor: your open interventions"),
+    BotCommand(command="review", description="✅ Mentor: review a report"),
+    BotCommand(command="done", description="✔️ Mentor: close an intervention"),
+    BotCommand(command="brief", description="📊 Management: executive brief"),
+]
+
+
+async def _publish_menu(bot: Bot) -> None:
+    try:
+        await bot.set_my_commands(_MENU)
+        logger.info("bot.menu_published", count=len(_MENU))
+    except Exception as exc:  # noqa: BLE001 - a menu failure must not stop the bot
+        logger.warning("bot.menu_failed", error=str(exc))
+
+
 async def run_bot() -> None:
     configure_logging()
     settings = get_settings()
@@ -232,6 +253,7 @@ async def run_bot() -> None:
     bot = Bot(settings.telegram_token)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
+    await _publish_menu(bot)
     logger.info("bot.starting")
     await dp.start_polling(bot)
 

@@ -55,3 +55,11 @@ INTERVENTION_COMPLETED = "mentor_intervention.completed"
 INTERVENTION_OVERDUE = "intervention.overdue"
 MILESTONE_AWARDED = "milestone.awarded"
 STUDENT_GRADUATED = "student.graduated"
+
+# Truth & Verification layer (Slice 2)
+CLAIM_RECORDED = "claim.recorded"
+EVIDENCE_ATTACHED = "claim.evidence_attached"
+VERIFICATION_RECORDED = "claim.verification_recorded"
+CLAIM_STATE_CHANGED = "claim.state_changed"
+VERIFICATION_EXCEPTION_RAISED = "claim.exception_raised"
+VERIFICATION_EXCEPTION_RESOLVED = "claim.exception_resolved"

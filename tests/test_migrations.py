@@ -15,10 +15,16 @@ from datetime import UTC, date, datetime
 from sqlalchemy import create_engine, func, inspect, select
 from sqlalchemy.orm import Session
 
+from alembic.script import ScriptDirectory
 from app import db as db_module
 from app.bootstrap import Base, create_schema  # noqa: F401  (Base via bootstrap)
 from app.config import get_settings
-from app.migrate import run_migrations_sync, sync_url
+from app.migrate import _config, run_migrations_sync, sync_url
+
+
+def _head(url: str) -> str:
+    """The current Alembic head revision (moves as slices add migrations)."""
+    return ScriptDirectory.from_config(_config(url)).get_current_head()
 
 
 def _use_db(monkeypatch, path) -> str:
@@ -60,7 +66,7 @@ def test_baseline_matches_create_all_schema(tmp_path, monkeypatch) -> None:
     url_mig = _use_db(monkeypatch, tmp_path / "mig.db")
     result = run_migrations_sync()
     assert result["action"] == "upgraded"
-    assert result["revision"] == "0001_baseline"
+    assert result["revision"] == _head(url_mig)
     migrated = _snapshot(url_mig)
 
     # B: schema built directly from the models (create_all).
@@ -112,14 +118,14 @@ def test_adopts_existing_schema_without_data_loss(tmp_path, monkeypatch) -> None
     # First migration run: it must ADOPT (stamp), not recreate.
     result = run_migrations_sync()
     assert result["action"] == "adopted"
-    assert result["revision"] == "0001_baseline"
+    assert result["revision"] == _head(url)
     assert inspect(engine).has_table("alembic_version")
     assert counts() == before, "adoption must preserve every row"
 
     # Second run: idempotent no-op (now versioned → upgrade head, already current).
     result2 = run_migrations_sync()
     assert result2["action"] == "upgraded"
-    assert result2["revision"] == "0001_baseline"
+    assert result2["revision"] == _head(url)
     assert counts() == before
 
     engine.dispose()
@@ -129,5 +135,5 @@ def test_fresh_database_is_created_by_migrations(tmp_path, monkeypatch) -> None:
     url = _use_db(monkeypatch, tmp_path / "fresh.db")
     result = run_migrations_sync()
     assert result["action"] == "upgraded"
-    assert result["revision"] == "0001_baseline"
+    assert result["revision"] == _head(url)
     assert inspect(create_engine(url)).has_table("person")

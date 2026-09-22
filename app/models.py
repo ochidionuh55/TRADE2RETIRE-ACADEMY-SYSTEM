@@ -223,3 +223,82 @@ class WorkSchedule(IdMixin, TimestampMixin, Base):
 
 # Open, un-completed states an intervention can sit in.
 OPEN_STATES: frozenset[str] = frozenset({"open", "overdue"})
+
+
+# ── Truth & Verification layer (Increment 2 · Slice 2) ────────────────────────
+# The reusable provenance spine. A Claim is what someone (or the system) says
+# happened; Evidence supports it; a Verification is an independent check;
+# an Exception records a conflict without accusing anyone. The original claim
+# and its evidence are never mutated away — state moves forward, auditably.
+
+
+class Claim(IdMixin, TimestampMixin, Base):
+    """A stated fact and its position on the road from assertion to verified."""
+
+    __tablename__ = "claim"
+    __table_args__ = (
+        Index("ix_claim_type", "claim_type"),
+        Index("ix_claim_subject", "subject_person_id"),
+        Index("ix_claim_state", "provenance_state"),
+    )
+
+    claim_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Who/what the claim is about, and who asserted it (NULL asserter = system).
+    subject_person_id: Mapped[int | None] = mapped_column(ForeignKey("person.id"))
+    asserted_by_person_id: Mapped[int | None] = mapped_column(ForeignKey("person.id"))
+    asserted_role: Mapped[str] = mapped_column(String(24), nullable=False, default="system")
+    # The claimed content itself.
+    statement: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False, default=dict)
+    # Provenance/verification, as strings/ints from app.truth.
+    provenance_state: Mapped[str] = mapped_column(String(24), nullable=False)
+    verification_level: Mapped[int] = mapped_column(nullable=False, default=0)
+    # Snapshot of the strength this claim type required at creation (audit).
+    required_level: Mapped[int] = mapped_column(nullable=False, default=0)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    evidence_ref: Mapped[str | None] = mapped_column(String(80))
+
+
+class Evidence(IdMixin, TimestampMixin, Base):
+    """A piece of evidence attached to a claim. Never deleted."""
+
+    __tablename__ = "evidence"
+    __table_args__ = (Index("ix_evidence_claim", "claim_id"),)
+
+    claim_id: Mapped[int] = mapped_column(ForeignKey("claim.id"), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)  # photo|link|telegram_file|…
+    ref: Mapped[str] = mapped_column(String(400), nullable=False, default="")
+    submitted_by_person_id: Mapped[int | None] = mapped_column(ForeignKey("person.id"))
+    note: Mapped[str | None] = mapped_column(Text)
+
+
+class Verification(IdMixin, TimestampMixin, Base):
+    """An independent check of a claim and its outcome. Append-only."""
+
+    __tablename__ = "verification"
+    __table_args__ = (Index("ix_verification_claim", "claim_id"),)
+
+    claim_id: Mapped[int] = mapped_column(ForeignKey("claim.id"), nullable=False)
+    method: Mapped[str] = mapped_column(String(48), nullable=False)  # office_challenge|manual|…
+    checked_by_person_id: Mapped[int | None] = mapped_column(ForeignKey("person.id"))
+    outcome: Mapped[str] = mapped_column(String(16), nullable=False)  # pass|fail|inconclusive
+    level_reached: Mapped[int] = mapped_column(nullable=False, default=0)
+    note: Mapped[str | None] = mapped_column(Text)
+
+
+class VerificationException(IdMixin, TimestampMixin, Base):
+    """A conflict around a claim — an exception to resolve, not an accusation.
+
+    Preserves the original claim (never rewritten) and, on manual override, the
+    prior state, actor, time and reason (recorded as events).
+    """
+
+    __tablename__ = "verification_exception"
+    __table_args__ = (Index("ix_vexception_status", "status"),)
+
+    claim_id: Mapped[int] = mapped_column(ForeignKey("claim.id"), nullable=False)
+    reason_code: Mapped[str] = mapped_column(String(48), nullable=False)
+    detail: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="open")
+    reviewer_person_id: Mapped[int | None] = mapped_column(ForeignKey("person.id"))
+    resolution: Mapped[str | None] = mapped_column(Text)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
