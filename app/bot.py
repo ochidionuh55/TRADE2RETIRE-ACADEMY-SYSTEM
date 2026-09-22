@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import asyncio
 import html
+from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -103,16 +105,11 @@ def _can_roster(roles: set[Role]) -> bool:
     return has_role(roles, Role.ADMIN, Role.CO_OWNER, Role.CEO)
 
 
-def _menu_keyboard(roles: set[Role]) -> InlineKeyboardMarkup:
-    """A tap-friendly home screen, showing only what this person may do."""
+def _tools_keyboard(roles: set[Role]) -> InlineKeyboardMarkup:
+    """The secondary tool rows — everything this person may reach, but never the
+    stage-specific next action, which The Office decides."""
     rows: list[list[InlineKeyboardButton]] = []
     if is_staff(roles):
-        rows.append(
-            [
-                InlineKeyboardButton(text="🏢 Check in", callback_data="cb:checkin"),
-                InlineKeyboardButton(text="📅 My day", callback_data="cb:myday"),
-            ]
-        )
         rows.append([InlineKeyboardButton(text="👤 My record", callback_data="cb:me")])
     rows.append([InlineKeyboardButton(text="📝 Friday review", callback_data="cb:friday")])
     if has_role(roles, Role.MENTOR):
@@ -135,11 +132,110 @@ def _menu_keyboard(roles: set[Role]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _home_text(name: str) -> str:
-    return (
-        f"👋 <b>{esc(get_settings().academy_name)}</b>\n"
-        f"Welcome back, <b>{esc(name)}</b>.\n\n"
-        "<i>Your operating hub — tap below.</i>"
+def _greeting() -> str:
+    hour = datetime.now(UTC).astimezone(ZoneInfo(get_settings().timezone)).hour
+    if hour < 12:
+        return "Good morning"
+    if hour < 17:
+        return "Good afternoon"
+    return "Good evening"
+
+
+async def _edit_or_send(cq: CallbackQuery, text: str, kb: InlineKeyboardMarkup) -> None:
+    """Refresh the screen in place; fall back to a new message if it can't be
+    edited (unchanged content, or too old)."""
+    try:
+        await cq.message.edit_text(text, reply_markup=kb)
+    except Exception:  # noqa: BLE001 - an un-editable message must not break the tap
+        await cq.message.answer(text, reply_markup=kb)
+
+
+async def _office(uid: int, uname: str) -> tuple[str, InlineKeyboardMarkup]:
+    """The one screen a person walks into. It always knows where they are in
+    their day and offers the single next action — arrive, plan, work, leave."""
+    async with session_scope() as s:
+        person, roles = await resolve_person(s, uid, uname)
+        name = person.full_name or "there"
+        staff = is_staff(roles)
+        ci = None
+        prios: list = []
+        closed = False
+        if staff:
+            today = work_date()
+            ci = (
+                await s.execute(
+                    select(CheckIn).where(
+                        CheckIn.person_id == person.id, CheckIn.work_date == today
+                    )
+                )
+            ).scalar_one_or_none()
+            prios = await list_priorities(s, person=person)
+            closed = await has_closed(s, person=person)
+
+    lines = [
+        f"🏢 <b>{esc(get_settings().academy_name)}</b>",
+        f"{_greeting()}, <b>{esc(name)}</b>.",
+        RULE,
+    ]
+    primary: list[list[InlineKeyboardButton]] = []
+
+    if not staff:
+        lines.append("<i>Your weekly trading review is below when you're ready.</i>")
+        return "\n".join(lines), InlineKeyboardMarkup(
+            inline_keyboard=primary + _tools_keyboard(roles).inline_keyboard
+        )
+
+    if ci is None:
+        # Stage 1 — they haven't walked in yet.
+        lines.append("You haven't checked in yet today.")
+        primary.append([InlineKeyboardButton(text="🏢 Check in", callback_data="cb:checkin")])
+    else:
+        if ci.presence_type == OFFICE and ci.verified:
+            lines.append("✅ Checked in — <b>Office</b> (verified)")
+        elif ci.presence_type == OFFICE:
+            lines.append("🟡 Checked in — <b>Office</b> (unverified)")
+        else:
+            lines.append(f"✅ Checked in — <b>{esc(ci.presence_type)}</b>")
+
+        done = sum(1 for p in prios if p.status == "done")
+        if closed:
+            # Stage 5 — they've left for the day.
+            lines += ["", "🌙 <b>Day closed.</b> See you tomorrow."]
+            if prios:
+                lines.append(f"{done}/{len(prios)} priorities done.")
+        elif not prios:
+            # Stage 2 — in, but no plan yet.
+            lines += ["", "No priorities set yet."]
+            primary.append(
+                [InlineKeyboardButton(text="✍️ Set today's plan", callback_data="cb:plan")]
+            )
+        else:
+            # Stages 3 & 4 — working the plan.
+            lines += ["", "<b>Today's priorities</b>"]
+            for p in prios:
+                mark = "✅" if p.status == "done" else "⬜"
+                lines.append(f"{mark} {esc(p.body)}")
+            lines += ["", f"<b>{done}/{len(prios)}</b> done"]
+            if done == len(prios):
+                lines.append("🎉 All done — nice work.")
+            for p in prios:
+                if p.status == "open":
+                    label = p.body if len(p.body) <= 24 else p.body[:23] + "…"
+                    primary.append(
+                        [
+                            InlineKeyboardButton(
+                                text=f"✔ {label}", callback_data=f"cb:done:{p.id}"
+                            )
+                        ]
+                    )
+            actions: list[InlineKeyboardButton] = []
+            if len(prios) < MAX_PRIORITIES:
+                actions.append(InlineKeyboardButton(text="✍️ Add", callback_data="cb:plan"))
+            actions.append(InlineKeyboardButton(text="🌙 Close day", callback_data="cb:close"))
+            primary.append(actions)
+
+    return "\n".join(lines), InlineKeyboardMarkup(
+        inline_keyboard=primary + _tools_keyboard(roles).inline_keyboard
     )
 
 
@@ -276,25 +372,16 @@ async def _queue_text(uid: int, uname: str) -> str:
 async def start(message: Message) -> None:
     if message.from_user is None:
         return
-    async with session_scope() as s:
-        person, roles = await resolve_person(
-            s, message.from_user.id, message.from_user.full_name
-        )
-    name = person.full_name or "there"
-    await message.answer(_home_text(name), reply_markup=_menu_keyboard(roles))
+    text, kb = await _office(message.from_user.id, message.from_user.full_name)
+    await message.answer(text, reply_markup=kb)
 
 
 @router.message(Command("menu"))
 async def menu(message: Message) -> None:
     if message.from_user is None:
         return
-    async with session_scope() as s:
-        person, roles = await resolve_person(
-            s, message.from_user.id, message.from_user.full_name
-        )
-    await message.answer(
-        _home_text(person.full_name or "there"), reply_markup=_menu_keyboard(roles)
-    )
+    text, kb = await _office(message.from_user.id, message.from_user.full_name)
+    await message.answer(text, reply_markup=kb)
 
 
 @router.message(Command("me"))
@@ -502,12 +589,8 @@ async def _finish_checkin(
         )
     await state.clear()
     if not created:
-        await message.answer(
-            f"You already checked in today (<b>{esc(check.presence_type)}</b>).",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return
-    if presence == OFFICE and check.verified:
+        text = f"You already checked in today (<b>{esc(check.presence_type)}</b>)."
+    elif presence == OFFICE and check.verified:
         text = "✅ <b>Checked in — Office, verified.</b>\nHave a great day."
     elif presence == OFFICE:
         text = (
@@ -517,6 +600,8 @@ async def _finish_checkin(
     else:
         text = f"✅ <b>Checked in — {esc(presence)}.</b> Recorded."
     await message.answer(text, reply_markup=ReplyKeyboardRemove())
+    office_text, kb = await _office(message.from_user.id, message.from_user.full_name)
+    await message.answer(office_text, reply_markup=kb)
 
 
 @router.message(Command("checkin"))
@@ -670,42 +755,6 @@ class Close(StatesGroup):
     blockers = State()
 
 
-def _myday_keyboard(prios: list, closed: bool) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    for p in prios:
-        if p.status == "open":
-            label = p.body if len(p.body) <= 24 else p.body[:23] + "…"
-            rows.append(
-                [InlineKeyboardButton(text=f"✔ {label}", callback_data=f"cb:done:{p.id}")]
-            )
-    actions = [InlineKeyboardButton(text="✍️ Plan", callback_data="cb:plan")]
-    if not closed:
-        actions.append(InlineKeyboardButton(text="🌙 Close day", callback_data="cb:close"))
-    rows.append(actions)
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-async def _myday(uid: int, uname: str) -> tuple[str, InlineKeyboardMarkup | None]:
-    async with session_scope() as s:
-        person, roles = await resolve_person(s, uid, uname)
-        if not is_staff(roles):
-            return "🔒 Your day view is for staff.", None
-        prios = await list_priorities(s, person=person)
-        closed = await has_closed(s, person=person)
-    lines = [f"📅 <b>YOUR DAY</b> · {esc(work_date().isoformat())}", RULE]
-    if not prios:
-        lines.append("<i>No priorities set yet.</i> Tap ✍️ Plan to set up to 3.")
-    else:
-        done = sum(1 for p in prios if p.status == "done")
-        for p in prios:
-            mark = "✅" if p.status == "done" else "⬜"
-            lines.append(f"{mark} {esc(p.body)}")
-        lines.append("")
-        tail = "  ·  🌙 day closed" if closed else ""
-        lines.append(f"<b>{done}/{len(prios)}</b> done{tail}")
-    return "\n".join(lines), _myday_keyboard(prios, closed)
-
-
 async def _standup_text(uid: int, uname: str) -> str:
     async with session_scope() as s:
         _, roles = await resolve_person(s, uid, uname)
@@ -769,7 +818,7 @@ async def _close_start(message: Message, state: FSMContext, uid: int, uname: str
 async def myday(message: Message) -> None:
     if message.from_user is None:
         return
-    text, kb = await _myday(message.from_user.id, message.from_user.full_name)
+    text, kb = await _office(message.from_user.id, message.from_user.full_name)
     await message.answer(text, reply_markup=kb)
 
 
@@ -802,18 +851,14 @@ async def plan_step(message: Message, state: FSMContext) -> None:
         )
         status, _ = await add_priority(s, person=person, body=message.text or "")
         count = len(await list_priorities(s, person=person))
-    if status == "full":
-        await state.clear()
-        await message.answer(f"That's your {MAX_PRIORITIES} for today. Tap /myday to work them.")
-        return
     if status == "empty":
         await message.answer("Send a few words describing the priority (or /cancel).")
         return
-    if count >= MAX_PRIORITIES:
+    if status == "full" or count >= MAX_PRIORITIES:
         await state.clear()
-        await message.answer(
-            f"✅ Got it — that's {MAX_PRIORITIES}/{MAX_PRIORITIES}. /myday to work them."
-        )
+        await message.answer(f"✅ That's your {MAX_PRIORITIES} for today — here's your day:")
+        office_text, kb = await _office(message.from_user.id, message.from_user.full_name)
+        await message.answer(office_text, reply_markup=kb)
         return
     await message.answer(
         f"✅ Saved ({count}/{MAX_PRIORITIES}). Send another, or /cancel to finish."
@@ -856,6 +901,8 @@ async def close_blockers(message: Message, state: FSMContext) -> None:
         if created
         else "You'd already closed today; the first one stands."
     )
+    office_text, kb = await _office(message.from_user.id, message.from_user.full_name)
+    await message.answer(office_text, reply_markup=kb)
 
 
 @router.message(Command("standup"))
@@ -916,11 +963,11 @@ async def cb_friday(cq: CallbackQuery, state: FSMContext) -> None:
     await _friday_start(cq.message, state)
 
 
-@router.callback_query(F.data == "cb:myday")
-async def cb_myday(cq: CallbackQuery) -> None:
+@router.callback_query(F.data.in_({"cb:myday", "cb:home"}))
+async def cb_home(cq: CallbackQuery) -> None:
     await cq.answer()
-    text, kb = await _myday(cq.from_user.id, cq.from_user.full_name)
-    await cq.message.answer(text, reply_markup=kb)
+    text, kb = await _office(cq.from_user.id, cq.from_user.full_name)
+    await _edit_or_send(cq, text, kb)
 
 
 @router.callback_query(F.data == "cb:plan")
@@ -951,8 +998,8 @@ async def cb_done_priority(cq: CallbackQuery) -> None:
     async with session_scope() as s:
         person, _ = await resolve_person(s, cq.from_user.id, cq.from_user.full_name)
         await complete_priority(s, person=person, priority_id=pid)
-    text, kb = await _myday(cq.from_user.id, cq.from_user.full_name)
-    await cq.message.answer(text, reply_markup=kb)
+    text, kb = await _office(cq.from_user.id, cq.from_user.full_name)
+    await _edit_or_send(cq, text, kb)
 
 
 # The command menu shown when a user types "/". Access is still enforced
