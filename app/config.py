@@ -42,6 +42,20 @@ class Settings(BaseSettings):
     # verification is unsupported (a check-in can never be office-verified, and
     # is never faked as verified). Set T2R__OFFICE_SECRET to enable it.
     office_secret: str = Field(default="", description="Secret for the office check-in code.")
+    # Geofenced office check-in. When office_lat AND office_lng are set, an
+    # OFFICE check-in can be corroborated by the staff member sharing their
+    # location: inside office_radius_m → verified; outside → recorded but
+    # unverified (never a fake present). Unset = geofence unsupported (the check
+    # falls back to the office code, if that is configured).
+    office_lat: float | None = Field(
+        default=None, description="Office latitude for geofenced check-in."
+    )
+    office_lng: float | None = Field(
+        default=None, description="Office longitude for geofenced check-in."
+    )
+    office_radius_m: int = Field(
+        default=75, description="Geofence radius in metres for an office check-in."
+    )
 
     @field_validator("database_url", mode="before")
     @classmethod

@@ -34,8 +34,11 @@ from app.attendance import (
     check_in,
     current_office_code,
     is_valid_office_code,
+    is_within_office,
     minutes_left_in_window,
+    office_distance_m,
     office_enabled,
+    office_geofence_enabled,
 )
 from app.config import PROCESS, get_settings
 from app.db import session_scope
@@ -113,7 +116,7 @@ async def friday_start(message: Message, state: FSMContext) -> None:
     )
 
 
-@router.message(Friday.collecting, F.text)
+@router.message(Friday.collecting, F.text & ~F.text.startswith("/"))
 async def friday_step(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     idx = int(data.get("idx", 0))
@@ -279,14 +282,19 @@ def _presence_keyboard() -> ReplyKeyboardMarkup:
 
 
 async def _finish_checkin(
-    message: Message, state: FSMContext, presence: str, code: str | None
+    message: Message,
+    state: FSMContext,
+    presence: str,
+    code: str | None,
+    lat: float | None = None,
+    lng: float | None = None,
 ) -> None:
     async with session_scope() as s:
         person, _ = await resolve_person(
             s, message.from_user.id, message.from_user.full_name
         )
         check, created = await check_in(
-            s, person=person, presence_type=presence, office_code=code
+            s, person=person, presence_type=presence, office_code=code, lat=lat, lng=lng
         )
     await state.clear()
     if not created:
@@ -300,7 +308,7 @@ async def _finish_checkin(
     elif presence == OFFICE:
         text = (
             "🟡 Checked in — OFFICE, recorded as *unverified* "
-            "(office verification isn't set up yet)."
+            "(couldn't confirm you're at the office)."
         )
     else:
         text = f"✅ Checked in — {presence}. Recorded."
@@ -322,32 +330,79 @@ async def checkin_start(message: Message, state: FSMContext) -> None:
     await message.answer("Where are you working today?", reply_markup=_presence_keyboard())
 
 
-@router.message(Checkin.presence, F.text)
+def _office_verify_keyboard() -> ReplyKeyboardMarkup | ReplyKeyboardRemove:
+    """The location button when a geofence is configured; nothing otherwise."""
+    if office_geofence_enabled():
+        return ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="📍 Share my location", request_location=True)]],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        )
+    return ReplyKeyboardRemove()
+
+
+def _office_prompt() -> str:
+    if office_geofence_enabled() and office_enabled():
+        return (
+            "Confirm you're at the office — tap “📍 Share my location”.\n"
+            "(No GPS? You can type today's office code instead.)"
+        )
+    if office_geofence_enabled():
+        return "Confirm you're at the office — tap “📍 Share my location”."
+    return "Enter today's office code (shown in the office):"
+
+
+@router.message(Checkin.presence, F.text & ~F.text.startswith("/"))
 async def checkin_presence(message: Message, state: FSMContext) -> None:
     presence = _LABEL_TO_PRESENCE.get((message.text or "").strip())
     if presence is None:
         await message.answer("Please tap one of the buttons.")
         return
-    if presence == OFFICE and office_enabled():
+    if presence == OFFICE and (office_geofence_enabled() or office_enabled()):
         await state.set_state(Checkin.code)
-        await message.answer(
-            "Enter today's office code (shown in the office):",
-            reply_markup=ReplyKeyboardRemove(),
-        )
+        await message.answer(_office_prompt(), reply_markup=_office_verify_keyboard())
         return
     await _finish_checkin(message, state, presence, None)
 
 
-@router.message(Checkin.code, F.text)
+@router.message(Checkin.code, F.location)
+async def checkin_location(message: Message, state: FSMContext) -> None:
+    loc = message.location
+    if loc is None:
+        return
+    within = is_within_office(loc.latitude, loc.longitude)
+    if within is None:
+        # Geofence not configured — shouldn't reach here (no button), stay honest.
+        await message.answer("Location check isn't set up. Type today's office code, or /cancel.")
+        return
+    if within:
+        await _finish_checkin(message, state, OFFICE, None, loc.latitude, loc.longitude)
+        return
+    dist = office_distance_m(loc.latitude, loc.longitude) or 0.0
+    radius = get_settings().office_radius_m
+    await message.answer(
+        f"📍 That's ~{dist:.0f}m from the office (the zone is {radius}m). "
+        "If you're actually working remotely, send /cancel and pick 🏠 Remote. "
+        "Otherwise move closer and share your location again."
+    )
+
+
+@router.message(Checkin.code, F.text & ~F.text.startswith("/"))
 async def checkin_code(message: Message, state: FSMContext) -> None:
     code = (message.text or "").strip()
-    if not is_valid_office_code(code):
+    if office_enabled() and is_valid_office_code(code):
+        await _finish_checkin(message, state, OFFICE, code)
+        return
+    if office_enabled():
         await message.answer(
             "That code didn't match the current office code. Type it again, "
             "or /cancel to pick a different presence."
         )
-        return
-    await _finish_checkin(message, state, OFFICE, code)
+    else:
+        await message.answer(
+            "Please tap “📍 Share my location” to confirm the office, "
+            "or /cancel to pick a different presence."
+        )
 
 
 @router.message(Command("cancel"))
@@ -404,8 +459,8 @@ async def today(message: Message) -> None:
         f"Remote / field        {data['remote_or_field']}",
         f"Approved away         {data['approved_away']}",
         "",
-        f"Office verification: {data['office_verification']}",
-        "Every figure is a canonical check-in; 'verified' means an office code corroborated it.",
+        f"Office verification: {data['office_verification']} ({data['office_method']})",
+        "Every figure is a canonical check-in; 'verified' means GPS or a code corroborated it.",
     ]
     await message.answer("\n".join(lines))
 

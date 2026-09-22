@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+from sqlalchemy import select
+
 from app.attendance import (
     LEAVE,
     OFFICE,
@@ -11,17 +13,28 @@ from app.attendance import (
     attendance_today,
     check_in,
     current_office_code,
+    is_within_office,
 )
 from app.config import get_settings
 from app.db import session_scope
-from app.models import Claim, Person
+from app.models import Claim, Evidence, Person
 from app.truth import ProvenanceState
 
 NOW = datetime(2026, 9, 22, 9, 0, tzinfo=UTC)
 
+# A stand-in office location (Port Harcourt) for geofence tests.
+OFFICE_LAT, OFFICE_LNG = 4.815600, 7.049800
+
 
 def _enable_office(monkeypatch) -> None:
     monkeypatch.setenv("T2R__OFFICE_SECRET", "office-test-secret")
+    get_settings.cache_clear()
+
+
+def _enable_geofence(monkeypatch, radius: int = 75) -> None:
+    monkeypatch.setenv("T2R__OFFICE_LAT", str(OFFICE_LAT))
+    monkeypatch.setenv("T2R__OFFICE_LNG", str(OFFICE_LNG))
+    monkeypatch.setenv("T2R__OFFICE_RADIUS_M", str(radius))
     get_settings.cache_clear()
 
 
@@ -91,3 +104,86 @@ async def test_office_unsupported_is_unverifiable_never_faked(db) -> None:
         claim = await s.get(Claim, check.claim_id)
     assert check.verified is False
     assert claim.provenance_state == ProvenanceState.UNVERIFIABLE.value
+
+
+# ── Geofence (GPS corroboration) ─────────────────────────────────────────────
+
+
+async def test_office_checkin_inside_geofence_is_verified(db, monkeypatch) -> None:
+    _enable_geofence(monkeypatch)
+    async with session_scope() as s:
+        favour = await _person(s)
+        # Standing on the office coordinates → distance ~0m, inside the radius.
+        check, created = await check_in(
+            s,
+            person=favour,
+            presence_type=OFFICE,
+            lat=OFFICE_LAT,
+            lng=OFFICE_LNG,
+            now=NOW,
+        )
+        claim = await s.get(Claim, check.claim_id)
+        evidence = (
+            await s.execute(select(Evidence).where(Evidence.claim_id == claim.id))
+        ).scalars().all()
+    assert created is True
+    assert check.verified is True
+    assert claim.provenance_state == ProvenanceState.VERIFIED.value
+    # The GPS position is kept as evidence on the claim.
+    assert any(e.kind == "gps" for e in evidence)
+
+
+async def test_office_checkin_outside_geofence_is_not_verified(db, monkeypatch) -> None:
+    _enable_geofence(monkeypatch)
+    # ~0.02° north of the office ≈ 2.2km away — well outside a 75m radius.
+    far_lat = OFFICE_LAT + 0.02
+    assert is_within_office(far_lat, OFFICE_LNG) is False
+    async with session_scope() as s:
+        favour = await _person(s)
+        check, _ = await check_in(
+            s,
+            person=favour,
+            presence_type=OFFICE,
+            lat=far_lat,
+            lng=OFFICE_LNG,
+            now=NOW,
+        )
+        claim = await s.get(Claim, check.claim_id)
+        evidence = (
+            await s.execute(select(Evidence).where(Evidence.claim_id == claim.id))
+        ).scalars().all()
+    # Not a fake "present": the claim stands, unverified, with the GPS on record.
+    assert check.verified is False
+    assert claim.provenance_state != ProvenanceState.VERIFIED.value
+    assert any(e.kind == "gps" for e in evidence)
+
+
+async def test_geofence_takes_precedence_over_code_when_location_shared(db, monkeypatch) -> None:
+    # Both signals configured. A valid location verifies even with no code typed.
+    _enable_office(monkeypatch)
+    _enable_geofence(monkeypatch)
+    async with session_scope() as s:
+        favour = await _person(s)
+        check, _ = await check_in(
+            s,
+            person=favour,
+            presence_type=OFFICE,
+            lat=OFFICE_LAT,
+            lng=OFFICE_LNG,
+            now=NOW,
+        )
+    assert check.verified is True
+
+
+async def test_geofence_method_is_reported_to_managers(db, monkeypatch) -> None:
+    _enable_geofence(monkeypatch)
+    async with session_scope() as s:
+        favour = await _person(s)
+        await check_in(
+            s, person=favour, presence_type=OFFICE, lat=OFFICE_LAT, lng=OFFICE_LNG, now=NOW
+        )
+    async with session_scope() as s:
+        data = await attendance_today(s, now=NOW)
+    assert data["office_verification"] == "enabled"
+    assert data["office_method"] == "geofence"
+    assert data["verified_present"] == 1
