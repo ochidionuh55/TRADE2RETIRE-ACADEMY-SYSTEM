@@ -302,3 +302,24 @@ class VerificationException(IdMixin, TimestampMixin, Base):
     reviewer_person_id: Mapped[int | None] = mapped_column(ForeignKey("person.id"))
     resolution: Mapped[str | None] = mapped_column(Text)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+# ── Staff attendance (Increment 2 · Slice 3) ──────────────────────────────────
+
+
+class CheckIn(IdMixin, TimestampMixin, Base):
+    """One attendance record per person per work day. The claim it links to
+    (in the Truth Ledger) carries the provenance; ``verified`` is the cached
+    view of whether the office challenge corroborated an OFFICE presence."""
+
+    __tablename__ = "check_in"
+    __table_args__ = (
+        UniqueConstraint("person_id", "work_date", name="uq_checkin_person_day"),
+        Index("ix_checkin_day", "work_date"),
+    )
+
+    person_id: Mapped[int] = mapped_column(ForeignKey("person.id"), nullable=False)
+    work_date: Mapped[date] = mapped_column(Date, nullable=False)
+    presence_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    claim_id: Mapped[int] = mapped_column(ForeignKey("claim.id"), nullable=False)
+    verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)

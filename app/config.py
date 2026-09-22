@@ -38,6 +38,10 @@ class Settings(BaseSettings):
     )
     academy_name: str = Field(default="Trade2Retire Academy")
     timezone: str = Field(default="Africa/Lagos")
+    # Secret behind the rotating office check-in code. EMPTY = office
+    # verification is unsupported (a check-in can never be office-verified, and
+    # is never faked as verified). Set T2R__OFFICE_SECRET to enable it.
+    office_secret: str = Field(default="", description="Secret for the office check-in code.")
 
     @field_validator("database_url", mode="before")
     @classmethod
@@ -111,6 +115,14 @@ class ProcessConfig:
 
     # Days a mentor has to act on an intervention before it is overdue.
     intervention_sla_days: int = 3
+
+    # ── Staff attendance policy (Increment 2 · Slice 3) ──────────────────────
+    # The office check-in code rotates every N minutes; a code from the current
+    # or the previous `grace` windows is accepted (covers clock skew and a staff
+    # member reading it a few minutes before typing). TODO(founder): confirm the
+    # rotation cadence that fits how the office actually runs.
+    office_code_window_minutes: int = 60
+    office_code_grace_windows: int = 1
 
     # Reporting week ends on Friday (weekday 4). Reports are due for the week
     # they cover; "missed" is judged after the week closes.

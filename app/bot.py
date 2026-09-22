@@ -13,15 +13,36 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BotCommand, Message
+from aiogram.types import (
+    BotCommand,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
 from sqlalchemy import select
 
+from app.attendance import (
+    FIELD,
+    LEAVE,
+    OFF_DUTY,
+    OFFICE,
+    REMOTE,
+    SICK,
+    TRAINING,
+    attendance_today,
+    check_in,
+    current_office_code,
+    is_valid_office_code,
+    minutes_left_in_window,
+    office_enabled,
+)
 from app.config import PROCESS, get_settings
 from app.db import session_scope
 from app.logging import configure_logging, get_logger
 from app.models import OPEN_STATES, FridayReport, Intervention, Person
 from app.people import resolve_person
-from app.roles import Role, has_role
+from app.roles import Role, has_role, is_management, is_manager, is_staff
 from app.services import (
     complete_intervention,
     format_brief,
@@ -224,12 +245,179 @@ async def review(message: Message) -> None:
     await message.answer("✅ Review recorded.")
 
 
+# ── Staff check-in (Slice 3) ─────────────────────────────────────────────────
+
+
+class Checkin(StatesGroup):
+    presence = State()
+    code = State()
+
+
+_PRESENCE_BUTTONS: list[tuple[str, str]] = [
+    ("🏢 Office", OFFICE),
+    ("🏠 Remote", REMOTE),
+    ("🚗 Field", FIELD),
+    ("🎓 Training", TRAINING),
+    ("🌴 Leave", LEAVE),
+    ("🤒 Sick", SICK),
+    ("⏸ Off duty", OFF_DUTY),
+]
+_LABEL_TO_PRESENCE: dict[str, str] = dict(_PRESENCE_BUTTONS)
+
+
+def _presence_keyboard() -> ReplyKeyboardMarkup:
+    rows = [
+        [
+            KeyboardButton(text=_PRESENCE_BUTTONS[i][0]),
+            KeyboardButton(text=_PRESENCE_BUTTONS[i + 1][0]),
+        ]
+        for i in range(0, len(_PRESENCE_BUTTONS) - 1, 2)
+    ]
+    rows.append([KeyboardButton(text=_PRESENCE_BUTTONS[-1][0])])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
+
+
+async def _finish_checkin(
+    message: Message, state: FSMContext, presence: str, code: str | None
+) -> None:
+    async with session_scope() as s:
+        person, _ = await resolve_person(
+            s, message.from_user.id, message.from_user.full_name
+        )
+        check, created = await check_in(
+            s, person=person, presence_type=presence, office_code=code
+        )
+    await state.clear()
+    if not created:
+        await message.answer(
+            f"You already checked in today ({check.presence_type}).",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+    if presence == OFFICE and check.verified:
+        text = "✅ Checked in — OFFICE, *verified*. Have a great day."
+    elif presence == OFFICE:
+        text = (
+            "🟡 Checked in — OFFICE, recorded as *unverified* "
+            "(office verification isn't set up yet)."
+        )
+    else:
+        text = f"✅ Checked in — {presence}. Recorded."
+    await message.answer(text, reply_markup=ReplyKeyboardRemove())
+
+
+@router.message(Command("checkin"))
+async def checkin_start(message: Message, state: FSMContext) -> None:
+    if message.from_user is None:
+        return
+    async with session_scope() as s:
+        _, roles = await resolve_person(
+            s, message.from_user.id, message.from_user.full_name
+        )
+    if not is_staff(roles):
+        await message.answer("Check-in is for staff.")
+        return
+    await state.set_state(Checkin.presence)
+    await message.answer("Where are you working today?", reply_markup=_presence_keyboard())
+
+
+@router.message(Checkin.presence, F.text)
+async def checkin_presence(message: Message, state: FSMContext) -> None:
+    presence = _LABEL_TO_PRESENCE.get((message.text or "").strip())
+    if presence is None:
+        await message.answer("Please tap one of the buttons.")
+        return
+    if presence == OFFICE and office_enabled():
+        await state.set_state(Checkin.code)
+        await message.answer(
+            "Enter today's office code (shown in the office):",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+    await _finish_checkin(message, state, presence, None)
+
+
+@router.message(Checkin.code, F.text)
+async def checkin_code(message: Message, state: FSMContext) -> None:
+    code = (message.text or "").strip()
+    if not is_valid_office_code(code):
+        await message.answer(
+            "That code didn't match the current office code. Type it again, "
+            "or /cancel to pick a different presence."
+        )
+        return
+    await _finish_checkin(message, state, OFFICE, code)
+
+
+@router.message(Command("cancel"))
+async def cancel(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("Cancelled.", reply_markup=ReplyKeyboardRemove())
+
+
+@router.message(Command("officecode"))
+async def officecode(message: Message) -> None:
+    if message.from_user is None:
+        return
+    async with session_scope() as s:
+        _, roles = await resolve_person(
+            s, message.from_user.id, message.from_user.full_name
+        )
+    if not has_role(
+        roles, Role.OPERATIONS, Role.ADMIN, Role.CEO, Role.CO_OWNER,
+        Role.HEAD_OF_ACADEMY, Role.HEAD_OF_SUPPORT,
+    ):
+        await message.answer("The office code is for operations/management.")
+        return
+    code = current_office_code()
+    if code is None:
+        await message.answer(
+            "Office verification isn't configured yet. Set T2R__OFFICE_SECRET to enable it."
+        )
+        return
+    await message.answer(
+        f"🔑 Office code: *{code}*\n"
+        f"Valid ~{minutes_left_in_window()} more min, then it rotates.\n"
+        "Display it in the office; staff enter it when they /checkin."
+    )
+
+
+@router.message(Command("today"))
+async def today(message: Message) -> None:
+    if message.from_user is None:
+        return
+    async with session_scope() as s:
+        _, roles = await resolve_person(
+            s, message.from_user.id, message.from_user.full_name
+        )
+        if not (is_manager(roles) or is_management(roles)):
+            await message.answer("Today's attendance is for managers.")
+            return
+        data = await attendance_today(s)
+    lines = [
+        f"👥 ATTENDANCE — {data['work_date']}",
+        "",
+        f"Checked in            {data['checked_in']}",
+        f"Verified present      {data['verified_present']}",
+        f"Office (unverified)   {data['unverified_office']}",
+        f"Remote / field        {data['remote_or_field']}",
+        f"Approved away         {data['approved_away']}",
+        "",
+        f"Office verification: {data['office_verification']}",
+        "Every figure is a canonical check-in; 'verified' means an office code corroborated it.",
+    ]
+    await message.answer("\n".join(lines))
+
+
 # The command menu shown when a user types "/". Access is still enforced
 # server-side per handler; this list is only the visible affordance.
 _MENU: list[BotCommand] = [
     BotCommand(command="start", description="🏠 Home — your menu"),
+    BotCommand(command="checkin", description="🏢 Check in for today"),
     BotCommand(command="me", description="👤 Your record and roles"),
     BotCommand(command="friday", description="📝 Submit this week's trading review"),
+    BotCommand(command="today", description="👥 Managers: today's attendance"),
+    BotCommand(command="officecode", description="🔑 Ops: current office code"),
     BotCommand(command="queue", description="🚨 Mentor: your open interventions"),
     BotCommand(command="review", description="✅ Mentor: review a report"),
     BotCommand(command="done", description="✔️ Mentor: close an intervention"),
