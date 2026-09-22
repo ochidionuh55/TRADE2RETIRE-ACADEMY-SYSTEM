@@ -18,6 +18,7 @@ guess an identity.
 
 from __future__ import annotations
 
+import secrets
 from dataclasses import dataclass
 
 from sqlalchemy import func, select
@@ -26,6 +27,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models import Department, Person, ReportingLine, StaffProfile
 from app.people import grant_role
 from app.roles import Role
+
+_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no confusable 0/O/1/I/L
+
+
+def _gen_join_code(length: int = 6) -> str:
+    return "".join(secrets.choice(_CODE_ALPHABET) for _ in range(length))
 
 
 @dataclass(frozen=True)
@@ -134,11 +141,15 @@ async def seed_org(session: AsyncSession) -> dict[str, int]:
                     department_id=dept.id if dept else None,
                     title=sseed.title,
                     is_demo=False,
+                    join_code=_gen_join_code(),
                 )
             )
         else:
             profile.title = sseed.title
             profile.department_id = dept.id if dept else profile.department_id
+            # Give an unlinked staff member a join code if they don't have one.
+            if profile.join_code is None and not profile.linked:
+                profile.join_code = _gen_join_code()
 
         for role in sseed.roles:
             await grant_role(session, person.id, role)

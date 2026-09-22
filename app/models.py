@@ -21,6 +21,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -174,7 +175,10 @@ class StaffProfile(IdMixin, TimestampMixin, Base):
     """Staff-side attributes for a canonical Person. One per staff member."""
 
     __tablename__ = "staff_profile"
-    __table_args__ = (UniqueConstraint("person_id", name="uq_staff_person"),)
+    __table_args__ = (
+        UniqueConstraint("person_id", name="uq_staff_person"),
+        Index("ix_staff_join_code", "join_code", unique=True),
+    )
 
     person_id: Mapped[int] = mapped_column(ForeignKey("person.id"), nullable=False)
     department_id: Mapped[int | None] = mapped_column(ForeignKey("department.id"))
@@ -184,6 +188,15 @@ class StaffProfile(IdMixin, TimestampMixin, Base):
     employment_type: Mapped[str] = mapped_column(String(24), nullable=False, default="office")
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     is_demo: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # One-time code a staff member sends to link their Telegram (Slice 3.5).
+    # Cleared once linked; NULLs are distinct so many can be unset at once.
+    # Uniqueness is a unique index (see __table_args__) so it migrates on SQLite.
+    join_code: Mapped[str | None] = mapped_column(String(12))
+    # server_default so the migration can add this column to the already-
+    # populated staff_profile table in production.
+    linked: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
 
 
 class ReportingLine(IdMixin, TimestampMixin, Base):

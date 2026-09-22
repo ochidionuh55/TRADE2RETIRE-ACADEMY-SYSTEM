@@ -41,6 +41,7 @@ from app.config import PROCESS, get_settings
 from app.db import session_scope
 from app.logging import configure_logging, get_logger
 from app.models import OPEN_STATES, FridayReport, Intervention, Person
+from app.onboarding import link_staff_by_code, roles_for, staff_roster
 from app.people import resolve_person
 from app.roles import Role, has_role, is_management, is_manager, is_staff
 from app.services import (
@@ -409,18 +410,74 @@ async def today(message: Message) -> None:
     await message.answer("\n".join(lines))
 
 
+# ── Staff onboarding (Slice 3.5) ─────────────────────────────────────────────
+
+
+@router.message(Command("join"))
+async def join(message: Message) -> None:
+    if message.from_user is None:
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Usage: /join YOURCODE  (ask your admin for your code)")
+        return
+    role_str = "staff"
+    async with session_scope() as s:
+        status, person = await link_staff_by_code(
+            s,
+            join_code=parts[1],
+            telegram_id=message.from_user.id,
+            full_name=message.from_user.full_name,
+        )
+        if status in ("linked", "already_linked") and person is not None:
+            roles = await roles_for(s, person)
+            role_str = ", ".join(sorted(r.value for r in roles)) or "staff"
+    if status == "invalid":
+        await message.answer(
+            "That code isn't valid or has already been used. Ask your admin for a fresh one."
+        )
+    elif status == "already_linked":
+        await message.answer(f"You're already linked, {person.full_name}. Roles: {role_str}.")
+    else:
+        await message.answer(
+            f"✅ Welcome, {person.full_name}! You're linked.\n"
+            f"Roles: {role_str}.\n\nUse /checkin to check in for today."
+        )
+
+
+@router.message(Command("roster"))
+async def roster(message: Message) -> None:
+    if message.from_user is None:
+        return
+    async with session_scope() as s:
+        _, roles = await resolve_person(
+            s, message.from_user.id, message.from_user.full_name
+        )
+        if not has_role(roles, Role.ADMIN, Role.CO_OWNER, Role.CEO):
+            await message.answer("The staff roster is for management.")
+            return
+        people = await staff_roster(s)
+    lines = ["👥 STAFF ROSTER", ""]
+    for p in people:
+        if p["linked"]:
+            lines.append(f"✅ {p['name']} — {p['title']}")
+        else:
+            lines.append(f"⬜ {p['name']} — {p['title']}  →  code: {p['join_code']}")
+    lines += ["", "Send each person their code; they send  /join CODE  to link."]
+    await message.answer("\n".join(lines))
+
+
 # The command menu shown when a user types "/". Access is still enforced
 # server-side per handler; this list is only the visible affordance.
 _MENU: list[BotCommand] = [
     BotCommand(command="start", description="🏠 Home — your menu"),
+    BotCommand(command="join", description="🔗 Link your staff account"),
     BotCommand(command="checkin", description="🏢 Check in for today"),
     BotCommand(command="me", description="👤 Your record and roles"),
     BotCommand(command="friday", description="📝 Submit this week's trading review"),
     BotCommand(command="today", description="👥 Managers: today's attendance"),
     BotCommand(command="officecode", description="🔑 Ops: current office code"),
-    BotCommand(command="queue", description="🚨 Mentor: your open interventions"),
-    BotCommand(command="review", description="✅ Mentor: review a report"),
-    BotCommand(command="done", description="✔️ Mentor: close an intervention"),
+    BotCommand(command="roster", description="🧾 Admin: staff join codes"),
     BotCommand(command="brief", description="📊 Management: executive brief"),
 ]
 
