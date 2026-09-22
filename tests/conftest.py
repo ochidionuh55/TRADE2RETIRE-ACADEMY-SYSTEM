@@ -21,9 +21,11 @@ async def db(tmp_path, monkeypatch):
     db_module._engine = None
     db_module._sessionmaker = None
 
-    from app.bootstrap import create_schema
+    # Tests run against the real migration path (Alembic upgrade to head), so
+    # they exercise exactly what production boot does.
+    from app.migrate import run_migrations
 
-    await create_schema()
+    await run_migrations()
     yield
 
     engine = db_module._engine

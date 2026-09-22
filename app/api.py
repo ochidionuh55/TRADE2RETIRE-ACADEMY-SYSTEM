@@ -11,9 +11,9 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.bootstrap import create_schema
 from app.config import get_settings
 from app.logging import configure_logging, get_logger
+from app.migrate import run_migrations
 
 logger = get_logger(__name__)
 
@@ -21,8 +21,10 @@ logger = get_logger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging()
-    await create_schema()
-    logger.info("api.ready")
+    # Alembic owns the schema. The advisory lock serialises with the worker so
+    # concurrent boots are safe; adoption/upgrade is idempotent.
+    result = await run_migrations()
+    logger.info("api.ready", **result)
     yield
 
 

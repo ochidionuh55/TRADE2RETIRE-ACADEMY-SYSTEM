@@ -18,13 +18,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.bootstrap import create_schema
 from app.db import session_scope
+from app.migrate import run_migrations
 from app.org import seed_org
 
 
 async def main() -> int:
-    await create_schema()
+    await run_migrations()
     async with session_scope() as s:
         summary = await seed_org(s)
     print(

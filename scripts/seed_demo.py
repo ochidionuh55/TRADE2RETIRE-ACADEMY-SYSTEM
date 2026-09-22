@@ -20,16 +20,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sqlalchemy import select
 
-from app.bootstrap import create_schema
 from app.config import get_settings
 from app.db import session_scope
+from app.migrate import run_migrations
 from app.models import Cohort, Enrolment, Person
 from app.people import grant_role
 from app.roles import Role
 
 
 async def main() -> int:
-    await create_schema()
+    await run_migrations()
     settings = get_settings()
     async with session_scope() as s:
         # is_demo=True keeps every one of these records out of production

@@ -11,9 +11,9 @@ import asyncio
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from app.bootstrap import create_schema
 from app.db import session_scope
 from app.logging import configure_logging, get_logger
+from app.migrate import run_migrations
 from app.org import seed_org
 from app.services import detect_missed_and_intervene, sweep_overdue
 
@@ -43,7 +43,7 @@ async def daily_pass() -> None:
 
 async def main() -> None:
     configure_logging()
-    await create_schema()
+    await run_migrations()  # Alembic owns the schema (adopt-or-upgrade, locked).
     await ensure_org()
     # Run once on boot so a fresh deploy is immediately current.
     await daily_pass()
