@@ -52,6 +52,15 @@ from app.attendance import (
     work_date,
 )
 from app.config import PROCESS, get_settings
+from app.daily import (
+    MAX_PRIORITIES,
+    add_priority,
+    complete_priority,
+    daily_rollup,
+    has_closed,
+    list_priorities,
+    submit_daily_close,
+)
 from app.db import session_scope
 from app.logging import configure_logging, get_logger
 from app.models import OPEN_STATES, CheckIn, FridayReport, Intervention, Person
@@ -101,15 +110,17 @@ def _menu_keyboard(roles: set[Role]) -> InlineKeyboardMarkup:
         rows.append(
             [
                 InlineKeyboardButton(text="🏢 Check in", callback_data="cb:checkin"),
-                InlineKeyboardButton(text="👤 My record", callback_data="cb:me"),
+                InlineKeyboardButton(text="📅 My day", callback_data="cb:myday"),
             ]
         )
+        rows.append([InlineKeyboardButton(text="👤 My record", callback_data="cb:me")])
     rows.append([InlineKeyboardButton(text="📝 Friday review", callback_data="cb:friday")])
     if has_role(roles, Role.MENTOR):
         rows.append([InlineKeyboardButton(text="📋 My queue", callback_data="cb:queue")])
     mgr: list[InlineKeyboardButton] = []
     if is_manager(roles) or is_management(roles):
         mgr.append(InlineKeyboardButton(text="👥 Today", callback_data="cb:today"))
+        mgr.append(InlineKeyboardButton(text="📋 Standup", callback_data="cb:standup"))
     if has_role(roles, Role.CEO, Role.ADMIN):
         mgr.append(InlineKeyboardButton(text="📊 Brief", callback_data="cb:brief"))
     if mgr:
@@ -647,6 +658,213 @@ async def roster(message: Message) -> None:
     await message.answer(await _roster_text(message.from_user.id, message.from_user.full_name))
 
 
+# ── Daily operating loop (Slice 4): priorities, done, Daily Close ────────────
+
+
+class Plan(StatesGroup):
+    collecting = State()
+
+
+class Close(StatesGroup):
+    summary = State()
+    blockers = State()
+
+
+def _myday_keyboard(prios: list, closed: bool) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for p in prios:
+        if p.status == "open":
+            label = p.body if len(p.body) <= 24 else p.body[:23] + "…"
+            rows.append(
+                [InlineKeyboardButton(text=f"✔ {label}", callback_data=f"cb:done:{p.id}")]
+            )
+    actions = [InlineKeyboardButton(text="✍️ Plan", callback_data="cb:plan")]
+    if not closed:
+        actions.append(InlineKeyboardButton(text="🌙 Close day", callback_data="cb:close"))
+    rows.append(actions)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _myday(uid: int, uname: str) -> tuple[str, InlineKeyboardMarkup | None]:
+    async with session_scope() as s:
+        person, roles = await resolve_person(s, uid, uname)
+        if not is_staff(roles):
+            return "🔒 Your day view is for staff.", None
+        prios = await list_priorities(s, person=person)
+        closed = await has_closed(s, person=person)
+    lines = [f"📅 <b>YOUR DAY</b> · {esc(work_date().isoformat())}", RULE]
+    if not prios:
+        lines.append("<i>No priorities set yet.</i> Tap ✍️ Plan to set up to 3.")
+    else:
+        done = sum(1 for p in prios if p.status == "done")
+        for p in prios:
+            mark = "✅" if p.status == "done" else "⬜"
+            lines.append(f"{mark} {esc(p.body)}")
+        lines.append("")
+        tail = "  ·  🌙 day closed" if closed else ""
+        lines.append(f"<b>{done}/{len(prios)}</b> done{tail}")
+    return "\n".join(lines), _myday_keyboard(prios, closed)
+
+
+async def _standup_text(uid: int, uname: str) -> str:
+    async with session_scope() as s:
+        _, roles = await resolve_person(s, uid, uname)
+        if not (is_manager(roles) or is_management(roles)):
+            return "🔒 The standup view is for managers."
+        data = await daily_rollup(s)
+    lines = [f"📋 <b>TEAM STANDUP</b> · {esc(data['work_date'])}", RULE]
+    people = data["people"]
+    if not people:
+        lines.append("<i>No priorities or closes logged yet today.</i>")
+    else:
+        for r in people:
+            close_mark = "🌙" if r["closed"] else "▫️"
+            lines.append(f"{close_mark} <b>{esc(r['name'])}</b> — {r['done']}/{r['total']} done")
+    lines += [
+        "",
+        f"Planned: <b>{data['planned']}</b> · Closed: <b>{data['closed']}</b>",
+        "<i>🌙 = submitted a Daily Close. Counts are self-reported.</i>",
+    ]
+    return "\n".join(lines)
+
+
+def _plan_ack(status: str) -> str:
+    if status == "full":
+        return (
+            f"You already have {MAX_PRIORITIES} priorities today — that's the cap. "
+            "/myday to see them."
+        )
+    if status == "empty":
+        return "That was empty — send a few words describing the priority."
+    return "✅ Added. /myday to see your day."
+
+
+async def _plan_start(message: Message, state: FSMContext, uid: int, uname: str) -> None:
+    async with session_scope() as s:
+        _, roles = await resolve_person(s, uid, uname)
+    if not is_staff(roles):
+        await message.answer("🔒 Planning is for staff.")
+        return
+    await state.set_state(Plan.collecting)
+    await message.answer(
+        f"✍️ <b>Set today's priorities</b> (up to {MAX_PRIORITIES}).\n"
+        "Send them one message at a time. /cancel when you're done."
+    )
+
+
+async def _close_start(message: Message, state: FSMContext, uid: int, uname: str) -> None:
+    async with session_scope() as s:
+        person, roles = await resolve_person(s, uid, uname)
+        if not is_staff(roles):
+            await message.answer("🔒 The Daily Close is for staff.")
+            return
+        if await has_closed(s, person=person):
+            await message.answer("You've already closed today. The first close stands.")
+            return
+    await state.set_state(Close.summary)
+    await message.answer("🌙 <b>Daily Close</b>\nWhat did you get done today?")
+
+
+@router.message(Command("myday"))
+async def myday(message: Message) -> None:
+    if message.from_user is None:
+        return
+    text, kb = await _myday(message.from_user.id, message.from_user.full_name)
+    await message.answer(text, reply_markup=kb)
+
+
+@router.message(Command("plan"))
+async def plan_start(message: Message, state: FSMContext) -> None:
+    if message.from_user is None:
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) == 2:  # one-shot: "/plan finish the audit"
+        async with session_scope() as s:
+            person, roles = await resolve_person(
+                s, message.from_user.id, message.from_user.full_name
+            )
+            if not is_staff(roles):
+                await message.answer("🔒 Planning is for staff.")
+                return
+            status, _ = await add_priority(s, person=person, body=parts[1])
+        await message.answer(_plan_ack(status))
+        return
+    await _plan_start(message, state, message.from_user.id, message.from_user.full_name)
+
+
+@router.message(Plan.collecting, F.text & ~F.text.startswith("/"))
+async def plan_step(message: Message, state: FSMContext) -> None:
+    if message.from_user is None:
+        return
+    async with session_scope() as s:
+        person, _ = await resolve_person(
+            s, message.from_user.id, message.from_user.full_name
+        )
+        status, _ = await add_priority(s, person=person, body=message.text or "")
+        count = len(await list_priorities(s, person=person))
+    if status == "full":
+        await state.clear()
+        await message.answer(f"That's your {MAX_PRIORITIES} for today. Tap /myday to work them.")
+        return
+    if status == "empty":
+        await message.answer("Send a few words describing the priority (or /cancel).")
+        return
+    if count >= MAX_PRIORITIES:
+        await state.clear()
+        await message.answer(
+            f"✅ Got it — that's {MAX_PRIORITIES}/{MAX_PRIORITIES}. /myday to work them."
+        )
+        return
+    await message.answer(
+        f"✅ Saved ({count}/{MAX_PRIORITIES}). Send another, or /cancel to finish."
+    )
+
+
+@router.message(Command("close"))
+async def close_start(message: Message, state: FSMContext) -> None:
+    if message.from_user is None:
+        return
+    await _close_start(message, state, message.from_user.id, message.from_user.full_name)
+
+
+@router.message(Close.summary, F.text & ~F.text.startswith("/"))
+async def close_summary(message: Message, state: FSMContext) -> None:
+    await state.update_data(summary=(message.text or "").strip())
+    await state.set_state(Close.blockers)
+    await message.answer("Anything blocked or rolling into tomorrow? (send “-” if nothing)")
+
+
+@router.message(Close.blockers, F.text & ~F.text.startswith("/"))
+async def close_blockers(message: Message, state: FSMContext) -> None:
+    if message.from_user is None:
+        await state.clear()
+        return
+    data = await state.get_data()
+    summary = data.get("summary", "")
+    raw = (message.text or "").strip()
+    blockers = None if raw == "-" else raw
+    async with session_scope() as s:
+        person, _ = await resolve_person(
+            s, message.from_user.id, message.from_user.full_name
+        )
+        _, created = await submit_daily_close(
+            s, person=person, summary=summary, blockers=blockers
+        )
+    await state.clear()
+    await message.answer(
+        "🌙 <b>Day closed</b> — thank you. Your manager can see it in the standup."
+        if created
+        else "You'd already closed today; the first one stands."
+    )
+
+
+@router.message(Command("standup"))
+async def standup(message: Message) -> None:
+    if message.from_user is None:
+        return
+    await message.answer(await _standup_text(message.from_user.id, message.from_user.full_name))
+
+
 # ── Inline command-center buttons ────────────────────────────────────────────
 
 
@@ -698,15 +916,58 @@ async def cb_friday(cq: CallbackQuery, state: FSMContext) -> None:
     await _friday_start(cq.message, state)
 
 
+@router.callback_query(F.data == "cb:myday")
+async def cb_myday(cq: CallbackQuery) -> None:
+    await cq.answer()
+    text, kb = await _myday(cq.from_user.id, cq.from_user.full_name)
+    await cq.message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data == "cb:plan")
+async def cb_plan(cq: CallbackQuery, state: FSMContext) -> None:
+    await cq.answer()
+    await _plan_start(cq.message, state, cq.from_user.id, cq.from_user.full_name)
+
+
+@router.callback_query(F.data == "cb:close")
+async def cb_close(cq: CallbackQuery, state: FSMContext) -> None:
+    await cq.answer()
+    await _close_start(cq.message, state, cq.from_user.id, cq.from_user.full_name)
+
+
+@router.callback_query(F.data == "cb:standup")
+async def cb_standup(cq: CallbackQuery) -> None:
+    await cq.answer()
+    await cq.message.answer(await _standup_text(cq.from_user.id, cq.from_user.full_name))
+
+
+@router.callback_query(F.data.startswith("cb:done:"))
+async def cb_done_priority(cq: CallbackQuery) -> None:
+    await cq.answer("Marked done ✅")
+    try:
+        pid = int((cq.data or "").rsplit(":", 1)[1])
+    except (ValueError, IndexError):
+        return
+    async with session_scope() as s:
+        person, _ = await resolve_person(s, cq.from_user.id, cq.from_user.full_name)
+        await complete_priority(s, person=person, priority_id=pid)
+    text, kb = await _myday(cq.from_user.id, cq.from_user.full_name)
+    await cq.message.answer(text, reply_markup=kb)
+
+
 # The command menu shown when a user types "/". Access is still enforced
 # server-side per handler; this list is only the visible affordance.
 _MENU: list[BotCommand] = [
     BotCommand(command="menu", description="🏠 Home — your command center"),
     BotCommand(command="checkin", description="🏢 Check in for today"),
+    BotCommand(command="myday", description="📅 Your priorities & Daily Close"),
+    BotCommand(command="plan", description="✍️ Set today's priorities"),
+    BotCommand(command="close", description="🌙 Close your day"),
     BotCommand(command="join", description="🔗 Link your staff account"),
     BotCommand(command="me", description="👤 Your record and roles"),
     BotCommand(command="friday", description="📝 Submit this week's trading review"),
     BotCommand(command="today", description="👥 Managers: today's attendance"),
+    BotCommand(command="standup", description="📋 Managers: team standup"),
     BotCommand(command="officecode", description="🔑 Ops: current office code"),
     BotCommand(command="roster", description="🧾 Admin: staff join codes"),
     BotCommand(command="brief", description="📊 Management: executive brief"),

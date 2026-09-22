@@ -336,3 +336,42 @@ class CheckIn(IdMixin, TimestampMixin, Base):
     presence_type: Mapped[str] = mapped_column(String(16), nullable=False)
     claim_id: Mapped[int] = mapped_column(ForeignKey("claim.id"), nullable=False)
     verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+
+# ── Daily operating loop (Increment 2 · Slice 4) ─────────────────────────────
+
+
+class Priority(IdMixin, TimestampMixin, Base):
+    """One of a person's stated priorities for a work day. A priority is a plan,
+    not a claim — only marking it done records a completion claim in the Truth
+    Ledger, so 'planned' and 'done (and provable)' never blur together."""
+
+    __tablename__ = "priority"
+    __table_args__ = (Index("ix_priority_person_day", "person_id", "work_date"),)
+
+    person_id: Mapped[int] = mapped_column(ForeignKey("person.id"), nullable=False)
+    work_date: Mapped[date] = mapped_column(Date, nullable=False)
+    body: Mapped[str] = mapped_column(String(280), nullable=False)
+    position: Mapped[int] = mapped_column(nullable=False, default=0)
+    # open | done | dropped
+    status: Mapped[str] = mapped_column(String(12), nullable=False, default="open")
+    claim_id: Mapped[int | None] = mapped_column(ForeignKey("claim.id"))
+    done_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class DailyClose(IdMixin, TimestampMixin, Base):
+    """A person's end-of-day close: what got done, what's blocked. One per day.
+    Self-reported (V0) by design; it feeds management as a stated report, and the
+    Truth Ledger labels it self-reported so no one mistakes it for verified fact."""
+
+    __tablename__ = "daily_close"
+    __table_args__ = (
+        UniqueConstraint("person_id", "work_date", name="uq_close_person_day"),
+        Index("ix_close_day", "work_date"),
+    )
+
+    person_id: Mapped[int] = mapped_column(ForeignKey("person.id"), nullable=False)
+    work_date: Mapped[date] = mapped_column(Date, nullable=False)
+    summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    blockers: Mapped[str | None] = mapped_column(Text)
+    claim_id: Mapped[int] = mapped_column(ForeignKey("claim.id"), nullable=False)
