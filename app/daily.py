@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.attendance import work_date
 from app.ledger import record_claim
 from app.models import DailyClose, Person, Priority
-from app.roles import Role
+from app.people import primary_actor_role
 from app.truth import CLAIM_DAILY_CLOSE, CLAIM_TASK_COMPLETED
 
 MAX_PRIORITIES = 3
@@ -96,7 +96,7 @@ async def complete_priority(
         statement={"priority": priority.body, "work_date": priority.work_date.isoformat()},
         subject_person_id=person.id,
         asserted_by_person_id=person.id,
-        asserted_role=Role.STUDENT,
+        asserted_role=await primary_actor_role(session, person),
         origin="self",
         occurred_at=moment,
     )
@@ -152,7 +152,7 @@ async def submit_daily_close(
         },
         subject_person_id=person.id,
         asserted_by_person_id=person.id,
-        asserted_role=Role.STUDENT,
+        asserted_role=await primary_actor_role(session, person),
         origin="self",
         occurred_at=moment,
     )

@@ -30,7 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import PROCESS, get_settings
 from app.ledger import INCONCLUSIVE, PASS, attach_evidence, record_claim, verify_claim
 from app.models import CheckIn, Person
-from app.roles import Role
+from app.people import primary_actor_role
 from app.truth import CLAIM_CHECK_IN, VerificationLevel
 
 # ── Presence types ───────────────────────────────────────────────────────────
@@ -190,7 +190,7 @@ async def check_in(
         statement={"presence_type": presence_type, "work_date": today.isoformat()},
         subject_person_id=person.id,
         asserted_by_person_id=person.id,
-        asserted_role=Role.SYSTEM if person is None else Role.STUDENT,
+        asserted_role=await primary_actor_role(session, person),
         origin="self",
         occurred_at=moment,
     )

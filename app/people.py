@@ -67,3 +67,38 @@ async def grant_role(session: AsyncSession, person_id: int, role: Role) -> None:
         session.add(RoleAssignment(person_id=person_id, role=role.value, active=True))
     else:
         existing.active = True
+
+
+# Stable attribution order for Truth Ledger claims when a person holds multiple
+# active roles. This affects provenance labels only; it never grants access.
+_ACTOR_ROLE_ORDER: tuple[Role, ...] = (
+    Role.CEO, Role.CO_OWNER, Role.ADMIN, Role.HEAD_OF_ACADEMY, Role.HEAD_OF_SUPPORT,
+    Role.OPERATIONS, Role.LEGAL, Role.FINANCE, Role.SALES, Role.SUPPORT,
+    Role.MENTOR, Role.INSTRUCTOR, Role.STUDENT,
+)
+
+
+async def primary_actor_role(session: AsyncSession, person: Person) -> Role:
+    """Return a deterministic active role for audit attribution.
+
+    People may hold several roles. Claims need one actor-role label, so choose a
+    stable role without changing authorization semantics. Unassigned people
+    remain STUDENT for backwards-compatible student flows.
+    """
+    rows = (
+        await session.execute(
+            select(RoleAssignment.role).where(
+                RoleAssignment.person_id == person.id, RoleAssignment.active.is_(True)
+            )
+        )
+    ).scalars().all()
+    active: set[Role] = set()
+    for value in rows:
+        try:
+            active.add(Role(value))
+        except ValueError:
+            continue
+    for role in _ACTOR_ROLE_ORDER:
+        if role in active:
+            return role
+    return Role.STUDENT

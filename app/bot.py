@@ -790,10 +790,21 @@ def _plan_ack(status: str) -> str:
 
 async def _plan_start(message: Message, state: FSMContext, uid: int, uname: str) -> None:
     async with session_scope() as s:
-        _, roles = await resolve_person(s, uid, uname)
-    if not is_staff(roles):
-        await message.answer("🔒 Planning is for staff.")
-        return
+        person, roles = await resolve_person(s, uid, uname)
+        if not is_staff(roles):
+            await message.answer("🔒 Planning is for staff.")
+            return
+        today = work_date()
+        checked_in = (
+            await s.execute(
+                select(CheckIn.id).where(
+                    CheckIn.person_id == person.id, CheckIn.work_date == today
+                )
+            )
+        ).scalar_one_or_none()
+        if checked_in is None:
+            await message.answer("🏢 Check in first, then set today's plan. /checkin")
+            return
     await state.set_state(Plan.collecting)
     await message.answer(
         f"✍️ <b>Set today's priorities</b> (up to {MAX_PRIORITIES}).\n"
@@ -806,6 +817,20 @@ async def _close_start(message: Message, state: FSMContext, uid: int, uname: str
         person, roles = await resolve_person(s, uid, uname)
         if not is_staff(roles):
             await message.answer("🔒 The Daily Close is for staff.")
+            return
+        today = work_date()
+        checked_in = (
+            await s.execute(
+                select(CheckIn.id).where(
+                    CheckIn.person_id == person.id, CheckIn.work_date == today
+                )
+            )
+        ).scalar_one_or_none()
+        if checked_in is None:
+            await message.answer("🏢 Check in first. A day that never started can't be closed.")
+            return
+        if not await list_priorities(s, person=person):
+            await message.answer("✍️ Set at least one priority before closing the day. /plan")
             return
         if await has_closed(s, person=person):
             await message.answer("You've already closed today. The first close stands.")
@@ -835,6 +860,17 @@ async def plan_start(message: Message, state: FSMContext) -> None:
             if not is_staff(roles):
                 await message.answer("🔒 Planning is for staff.")
                 return
+            today = work_date()
+            checked_in = (
+                await s.execute(
+                    select(CheckIn.id).where(
+                        CheckIn.person_id == person.id, CheckIn.work_date == today
+                    )
+                )
+            ).scalar_one_or_none()
+            if checked_in is None:
+                await message.answer("🏢 Check in first, then set today's plan. /checkin")
+                return
             status, _ = await add_priority(s, person=person, body=parts[1])
         await message.answer(_plan_ack(status))
         return
@@ -846,9 +882,13 @@ async def plan_step(message: Message, state: FSMContext) -> None:
     if message.from_user is None:
         return
     async with session_scope() as s:
-        person, _ = await resolve_person(
+        person, roles = await resolve_person(
             s, message.from_user.id, message.from_user.full_name
         )
+        if not is_staff(roles):
+            await state.clear()
+            await message.answer("🔒 Planning is for staff.")
+            return
         status, _ = await add_priority(s, person=person, body=message.text or "")
         count = len(await list_priorities(s, person=person))
     if status == "empty":
@@ -874,6 +914,15 @@ async def close_start(message: Message, state: FSMContext) -> None:
 
 @router.message(Close.summary, F.text & ~F.text.startswith("/"))
 async def close_summary(message: Message, state: FSMContext) -> None:
+    if message.from_user is None:
+        await state.clear()
+        return
+    async with session_scope() as s:
+        _, roles = await resolve_person(s, message.from_user.id, message.from_user.full_name)
+    if not is_staff(roles):
+        await state.clear()
+        await message.answer("🔒 The Daily Close is for staff.")
+        return
     await state.update_data(summary=(message.text or "").strip())
     await state.set_state(Close.blockers)
     await message.answer("Anything blocked or rolling into tomorrow? (send “-” if nothing)")
@@ -889,9 +938,13 @@ async def close_blockers(message: Message, state: FSMContext) -> None:
     raw = (message.text or "").strip()
     blockers = None if raw == "-" else raw
     async with session_scope() as s:
-        person, _ = await resolve_person(
+        person, roles = await resolve_person(
             s, message.from_user.id, message.from_user.full_name
         )
+        if not is_staff(roles):
+            await state.clear()
+            await message.answer("🔒 The Daily Close is for staff.")
+            return
         _, created = await submit_daily_close(
             s, person=person, summary=summary, blockers=blockers
         )
@@ -990,14 +1043,21 @@ async def cb_standup(cq: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("cb:done:"))
 async def cb_done_priority(cq: CallbackQuery) -> None:
-    await cq.answer("Marked done ✅")
     try:
         pid = int((cq.data or "").rsplit(":", 1)[1])
     except (ValueError, IndexError):
+        await cq.answer("Invalid priority.", show_alert=True)
         return
     async with session_scope() as s:
-        person, _ = await resolve_person(s, cq.from_user.id, cq.from_user.full_name)
-        await complete_priority(s, person=person, priority_id=pid)
+        person, roles = await resolve_person(s, cq.from_user.id, cq.from_user.full_name)
+        if not is_staff(roles):
+            await cq.answer("Staff access required.", show_alert=True)
+            return
+        completed = await complete_priority(s, person=person, priority_id=pid)
+    if completed is None:
+        await cq.answer("That priority isn't yours.", show_alert=True)
+        return
+    await cq.answer("Marked done ✅")
     text, kb = await _office(cq.from_user.id, cq.from_user.full_name)
     await _edit_or_send(cq, text, kb)
 
