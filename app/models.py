@@ -375,3 +375,54 @@ class DailyClose(IdMixin, TimestampMixin, Base):
     summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
     blockers: Mapped[str | None] = mapped_column(Text)
     claim_id: Mapped[int] = mapped_column(ForeignKey("claim.id"), nullable=False)
+
+
+# ── T2R Command: assignments and office correspondence ──────────────────────
+
+
+class Assignment(IdMixin, TimestampMixin, Base):
+    """Management-issued work. Completion is a claim until independently verified."""
+
+    __tablename__ = "assignment"
+    __table_args__ = (
+        Index("ix_assignment_assignee_status", "assignee_person_id", "status"),
+        Index("ix_assignment_due", "due_at"),
+    )
+
+    created_by_person_id: Mapped[int] = mapped_column(ForeignKey("person.id"), nullable=False)
+    assignee_person_id: Mapped[int] = mapped_column(ForeignKey("person.id"), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    cadence: Mapped[str] = mapped_column(String(16), nullable=False, default="today")
+    due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="assigned")
+    completion_claim_id: Mapped[int | None] = mapped_column(ForeignKey("claim.id"))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class AssignmentHistory(IdMixin, TimestampMixin, Base):
+    """Append-only lifecycle history for a management assignment."""
+
+    __tablename__ = "assignment_history"
+    __table_args__ = (Index("ix_assignment_history_assignment", "assignment_id"),)
+
+    assignment_id: Mapped[int] = mapped_column(ForeignKey("assignment.id"), nullable=False)
+    actor_person_id: Mapped[int | None] = mapped_column(ForeignKey("person.id"))
+    action: Mapped[str] = mapped_column(String(24), nullable=False)
+    detail: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class Correspondence(IdMixin, TimestampMixin, Base):
+    """Attributable internal office correspondence, retained as a company record."""
+
+    __tablename__ = "correspondence"
+    __table_args__ = (Index("ix_correspondence_recipient_status", "recipient_person_id", "status"),)
+
+    sender_person_id: Mapped[int] = mapped_column(ForeignKey("person.id"), nullable=False)
+    recipient_person_id: Mapped[int] = mapped_column(ForeignKey("person.id"), nullable=False)
+    category: Mapped[str] = mapped_column(String(32), nullable=False, default="report")
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="open")
+    parent_id: Mapped[int | None] = mapped_column(ForeignKey("correspondence.id"))
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

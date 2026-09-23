@@ -53,6 +53,33 @@ from app.attendance import (
     office_geofence_enabled,
     work_date,
 )
+from app.command import (
+    acknowledge_correspondence as command_acknowledge_correspondence,
+)
+from app.command import (
+    create_assignment as command_create_assignment,
+)
+from app.command import (
+    create_correspondence as command_create_correspondence,
+)
+from app.command import (
+    inbox as command_inbox,
+)
+from app.command import (
+    list_assignments as command_list_assignments,
+)
+from app.command import (
+    management_choices as command_management_choices,
+)
+from app.command import (
+    resolve_correspondence as command_resolve_correspondence,
+)
+from app.command import (
+    staff_choices as command_staff_choices,
+)
+from app.command import (
+    transition_assignment as command_transition_assignment,
+)
 from app.config import PROCESS, get_settings
 from app.daily import (
     MAX_PRIORITIES,
@@ -110,7 +137,12 @@ def _tools_keyboard(roles: set[Role]) -> InlineKeyboardMarkup:
     stage-specific next action, which The Office decides."""
     rows: list[list[InlineKeyboardButton]] = []
     if is_staff(roles):
-        rows.append([InlineKeyboardButton(text="👤 My record", callback_data="cb:me")])
+        rows.append(
+            [
+                InlineKeyboardButton(text="🗂 My Desk", callback_data="cb:desk"),
+                InlineKeyboardButton(text="👤 My record", callback_data="cb:me"),
+            ]
+        )
     rows.append([InlineKeyboardButton(text="📝 Friday review", callback_data="cb:friday")])
     if has_role(roles, Role.MENTOR):
         rows.append([InlineKeyboardButton(text="📋 My queue", callback_data="cb:queue")])
@@ -122,6 +154,13 @@ def _tools_keyboard(roles: set[Role]) -> InlineKeyboardMarkup:
         mgr.append(InlineKeyboardButton(text="📊 Brief", callback_data="cb:brief"))
     if mgr:
         rows.append(mgr)
+    if is_management(roles):
+        rows.append(
+            [
+                InlineKeyboardButton(text="Assign", callback_data="cmd:assign"),
+                InlineKeyboardButton(text="📥 Inbox", callback_data="cmd:inbox"),
+            ]
+        )
     ops: list[InlineKeyboardButton] = []
     if _can_officecode(roles):
         ops.append(InlineKeyboardButton(text="🔑 Office code", callback_data="cb:officecode"))
@@ -965,6 +1004,356 @@ async def standup(message: Message) -> None:
     await message.answer(await _standup_text(message.from_user.id, message.from_user.full_name))
 
 
+# ── T2R Command: assignments + management correspondence ─────────────────────
+
+
+class AssignWork(StatesGroup):
+    body = State()
+    due = State()
+
+
+class SendManagement(StatesGroup):
+    category = State()
+    body = State()
+
+
+class ReplyManagement(StatesGroup):
+    body = State()
+
+
+async def _safe_notify(bot: Bot, telegram_id: int | None, text: str) -> None:
+    if telegram_id is None:
+        return
+    try:
+        await bot.send_message(telegram_id, text)
+    except Exception as exc:  # noqa: BLE001 - delivery failure must not erase canonical state
+        logger.warning("command.notification_failed", telegram_id=telegram_id, error=str(exc))
+
+
+async def _desk_text(uid: int, uname: str) -> tuple[str, InlineKeyboardMarkup]:
+    async with session_scope() as s:
+        person, roles = await resolve_person(s, uid, uname)
+        if not is_staff(roles):
+            return "🔒 The Office Desk is for staff.", InlineKeyboardMarkup(inline_keyboard=[])
+        items = await command_list_assignments(s, person=person)
+        mail = await command_inbox(s, person=person)
+        lines = ["🗂 <b>MY DESK</b>", RULE]
+        buttons: list[list[InlineKeyboardButton]] = []
+        if items:
+            lines.append("<b>Assignments</b>")
+            for item in items[:8]:
+                creator = await s.get(Person, item.created_by_person_id)
+                who = creator.full_name if creator else "Management"
+                due = item.due_at.strftime("%a %d %b, %H:%M") if item.due_at else "No deadline"
+                lines.append(f"📌 <b>#{item.id}</b> {esc(item.body)}\n   From {esc(who)} · {esc(item.status)} · {esc(due)}")  # noqa: E501
+                if item.status == "assigned":
+                    buttons.append([InlineKeyboardButton(text=f"🤝 Accept #{item.id}", callback_data=f"cmd:accept:{item.id}")])  # noqa: E501
+                if item.status in ("assigned", "accepted", "in_progress", "blocked"):
+                    buttons.append([InlineKeyboardButton(text=f"✅ Submit #{item.id}", callback_data=f"cmd:done:{item.id}")])  # noqa: E501
+        else:
+            lines.append("<i>No open assignments.</i>")
+        lines += ["", f"📥 Open messages for you: <b>{len(mail)}</b>"]
+        buttons.append([InlineKeyboardButton(text="📤 Report to management", callback_data="cmd:report")])  # noqa: E501
+        if is_management(roles):
+            buttons.append([InlineKeyboardButton(text="+ Assign work", callback_data="cmd:assign")])
+            buttons.append([InlineKeyboardButton(text="📥 Management inbox", callback_data="cmd:inbox")])  # noqa: E501
+        buttons.append([InlineKeyboardButton(text="🏠 Back to Office", callback_data="cb:home")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def _inbox_text(uid: int, uname: str) -> tuple[str, InlineKeyboardMarkup]:
+    async with session_scope() as s:
+        person, _ = await resolve_person(s, uid, uname)
+        rows = await command_inbox(s, person=person)
+        lines = ["📥 <b>OFFICE INBOX</b>", RULE]
+        buttons: list[list[InlineKeyboardButton]] = []
+        if not rows:
+            lines.append("<i>Nothing waiting for you.</i>")
+        for item in rows[:12]:
+            sender = await s.get(Person, item.sender_person_id)
+            who = sender.full_name if sender else f"Person {item.sender_person_id}"
+            lines.append(f"\n<b>#{item.id}</b> · {esc(item.category)} · from <b>{esc(who)}</b>\n{esc(item.body)}\n<i>{esc(item.status)}</i>")  # noqa: E501
+            buttons.append([
+                InlineKeyboardButton(text=f"↩ Reply #{item.id}", callback_data=f"cmd:reply:{item.id}"),  # noqa: E501
+                InlineKeyboardButton(text=f"✓ Resolve #{item.id}", callback_data=f"cmd:resolve:{item.id}"),  # noqa: E501
+            ])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def _assign_start(message: Message, state: FSMContext, uid: int, uname: str) -> None:
+    async with session_scope() as s:
+        _, roles = await resolve_person(s, uid, uname)
+        if not is_management(roles):
+            await message.answer("🔒 Assigning company work is for authorized management.")
+            return
+        people = await command_staff_choices(s)
+    buttons = [[InlineKeyboardButton(text=p.full_name, callback_data=f"cmd:assignee:{p.id}")] for p in people]  # noqa: E501
+    await state.clear()
+    await message.answer("+ <b>ASSIGN WORK</b>\nWho should receive this assignment?", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))  # noqa: E501
+
+
+@router.message(Command("desk"))
+async def desk(message: Message) -> None:
+    if message.from_user is None:
+        return
+    text, kb = await _desk_text(message.from_user.id, message.from_user.full_name)
+    await message.answer(text, reply_markup=kb)
+
+
+@router.message(Command("assign"))
+async def assign_work(message: Message, state: FSMContext) -> None:
+    if message.from_user is None:
+        return
+    await _assign_start(message, state, message.from_user.id, message.from_user.full_name)
+
+
+@router.callback_query(F.data == "cmd:assign")
+async def cb_assign_work(cq: CallbackQuery, state: FSMContext) -> None:
+    await cq.answer()
+    await _assign_start(cq.message, state, cq.from_user.id, cq.from_user.full_name)
+
+
+@router.callback_query(F.data.startswith("cmd:assignee:"))
+async def cb_assignee(cq: CallbackQuery, state: FSMContext) -> None:
+    await cq.answer()
+    target_id = int(cq.data.rsplit(":", 1)[1])
+    async with session_scope() as s:
+        _, roles = await resolve_person(s, cq.from_user.id, cq.from_user.full_name)
+        valid_ids = {p.id for p in await command_staff_choices(s)}
+        if not is_management(roles) or target_id not in valid_ids:
+            await cq.message.answer("🔒 That assignment target isn't available to you.")
+            return
+    await state.set_state(AssignWork.body)
+    await state.update_data(assignee_id=target_id)
+    await cq.message.answer("Type the assignment exactly as the staff member should receive it.")
+
+
+@router.message(AssignWork.body, F.text & ~F.text.startswith("/"))
+async def assign_body(message: Message, state: FSMContext) -> None:
+    if message.from_user is None:
+        return
+    async with session_scope() as s:
+        _, roles = await resolve_person(s, message.from_user.id, message.from_user.full_name)
+        if not is_management(roles):
+            await state.clear()
+            await message.answer("🔒 Assignment cancelled: your authorization could not be confirmed.")  # noqa: E501
+            return
+    await state.update_data(body=(message.text or "").strip())
+    await state.set_state(AssignWork.due)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Today · 5 PM", callback_data="cmd:due:today"), InlineKeyboardButton(text="This week", callback_data="cmd:due:week")],  # noqa: E501
+        [InlineKeyboardButton(text="No deadline", callback_data="cmd:due:none")],
+    ])
+    await message.answer("When is it due?", reply_markup=kb)
+
+
+@router.callback_query(AssignWork.due, F.data.startswith("cmd:due:"))
+async def assign_due(cq: CallbackQuery, state: FSMContext) -> None:
+    await cq.answer()
+    data = await state.get_data()
+    due_kind = cq.data.rsplit(":", 1)[1]
+    target_telegram: int | None = None
+    target_name = "staff member"
+    async with session_scope() as s:
+        creator, roles = await resolve_person(s, cq.from_user.id, cq.from_user.full_name)
+        if not is_management(roles):
+            await state.clear()
+            await cq.message.answer("🔒 Assignment cancelled: authorization changed.")
+            return
+        item = await command_create_assignment(s, creator=creator, assignee_id=int(data["assignee_id"]), body=str(data["body"]), due_kind=due_kind)  # noqa: E501
+        target = await s.get(Person, item.assignee_person_id)
+        if target is not None:
+            target_telegram, target_name = target.telegram_id, target.full_name
+        item_id = item.id
+        body = item.body
+    await state.clear()
+    await cq.message.answer(f"✅ Assignment <b>#{item_id}</b> sent to <b>{esc(target_name)}</b>.")
+    await _safe_notify(cq.bot, target_telegram, f"📌 <b>NEW ASSIGNMENT #{item_id}</b>\nFrom: <b>{esc(cq.from_user.full_name)}</b>\n\n{esc(body)}\n\nOpen /desk to accept and track it.")  # noqa: E501
+
+
+@router.callback_query(F.data.startswith("cmd:accept:"))
+async def assignment_accept(cq: CallbackQuery) -> None:
+    await cq.answer()
+    item_id = int(cq.data.rsplit(":", 1)[1])
+    async with session_scope() as s:
+        person, roles = await resolve_person(s, cq.from_user.id, cq.from_user.full_name)
+        if not is_staff(roles):
+            result = None
+        else:
+            result = await command_transition_assignment(s, person=person, assignment_id=item_id, action="accept")  # noqa: E501
+    await cq.message.answer("🤝 Assignment accepted." if result else "Couldn't accept that assignment.")  # noqa: E501
+
+
+@router.callback_query(F.data.startswith("cmd:done:"))
+async def assignment_done(cq: CallbackQuery) -> None:
+    await cq.answer()
+    item_id = int(cq.data.rsplit(":", 1)[1])
+    manager_telegram: int | None = None
+    async with session_scope() as s:
+        person, roles = await resolve_person(s, cq.from_user.id, cq.from_user.full_name)
+        result = await command_transition_assignment(s, person=person, assignment_id=item_id, action="done") if is_staff(roles) else None  # noqa: E501
+        if result is not None:
+            creator = await s.get(Person, result.created_by_person_id)
+            manager_telegram = creator.telegram_id if creator else None
+    if result is None:
+        await cq.message.answer("Couldn't submit that assignment.")
+        return
+    await cq.message.answer("✅ Submitted to management. This is recorded as a completion claim, not auto-verified fact.")  # noqa: E501
+    await _safe_notify(cq.bot, manager_telegram, f"📥 <b>ASSIGNMENT SUBMITTED #{item_id}</b>\nBy: <b>{esc(cq.from_user.full_name)}</b>\nOpen /desk or /inbox to review company activity.")  # noqa: E501
+
+
+async def _report_start(message: Message, state: FSMContext, uid: int, uname: str) -> None:
+    async with session_scope() as s:
+        _, roles = await resolve_person(s, uid, uname)
+        if not is_staff(roles):
+            await message.answer("🔒 Management correspondence is for staff.")
+            return
+        people = await command_management_choices(s)
+    if not people:
+        await message.answer("No management recipient is configured yet.")
+        return
+    buttons = [[InlineKeyboardButton(text=p.full_name, callback_data=f"cmd:recipient:{p.id}")] for p in people]  # noqa: E501
+    await state.clear()
+    await message.answer("📤 <b>SEND TO MANAGEMENT</b>\nWho should receive it?", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))  # noqa: E501
+
+
+@router.message(Command("report"))
+async def report_management(message: Message, state: FSMContext) -> None:
+    if message.from_user is None:
+        return
+    await _report_start(message, state, message.from_user.id, message.from_user.full_name)
+
+
+@router.callback_query(F.data == "cmd:report")
+async def cb_report_management(cq: CallbackQuery, state: FSMContext) -> None:
+    await cq.answer()
+    await _report_start(cq.message, state, cq.from_user.id, cq.from_user.full_name)
+
+
+@router.callback_query(F.data.startswith("cmd:recipient:"))
+async def report_recipient(cq: CallbackQuery, state: FSMContext) -> None:
+    await cq.answer()
+    recipient_id = int(cq.data.rsplit(":", 1)[1])
+    async with session_scope() as s:
+        _, roles = await resolve_person(s, cq.from_user.id, cq.from_user.full_name)
+        valid_ids = {p.id for p in await command_management_choices(s)}
+        if not is_staff(roles) or recipient_id not in valid_ids:
+            await cq.message.answer("🔒 That recipient isn't available.")
+            return
+    await state.set_state(SendManagement.category)
+    await state.update_data(recipient_id=recipient_id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Report", callback_data="cmd:cat:report"), InlineKeyboardButton(text="🚧 Blocker", callback_data="cmd:cat:blocker")],  # noqa: E501
+        [InlineKeyboardButton(text="🙋 Request", callback_data="cmd:cat:request"), InlineKeyboardButton(text="💡 Suggestion", callback_data="cmd:cat:suggestion")],  # noqa: E501
+        [InlineKeyboardButton(text="⚠️ Complaint / concern", callback_data="cmd:cat:concern")],
+    ])
+    await cq.message.answer("What kind of message is this?", reply_markup=kb)
+
+
+@router.callback_query(SendManagement.category, F.data.startswith("cmd:cat:"))
+async def report_category(cq: CallbackQuery, state: FSMContext) -> None:
+    await cq.answer()
+    await state.update_data(category=cq.data.rsplit(":", 1)[1])
+    await state.set_state(SendManagement.body)
+    await cq.message.answer("Type your message. It will become an attributable company record.")
+
+
+@router.message(SendManagement.body, F.text & ~F.text.startswith("/"))
+async def report_body(message: Message, state: FSMContext) -> None:
+    if message.from_user is None:
+        return
+    data = await state.get_data()
+    recipient_telegram: int | None = None
+    recipient_name = "management"
+    async with session_scope() as s:
+        sender, roles = await resolve_person(s, message.from_user.id, message.from_user.full_name)
+        valid_ids = {p.id for p in await command_management_choices(s)}
+        recipient_id = int(data["recipient_id"])
+        if not is_staff(roles) or recipient_id not in valid_ids:
+            await state.clear()
+            await message.answer("🔒 Message cancelled: recipient/authorization changed.")
+            return
+        item = await command_create_correspondence(s, sender=sender, recipient_id=recipient_id, category=str(data["category"]), body=message.text or "")  # noqa: E501
+        recipient = await s.get(Person, recipient_id)
+        if recipient is not None:
+            recipient_telegram, recipient_name = recipient.telegram_id, recipient.full_name
+        item_id, body, category = item.id, item.body, item.category
+    await state.clear()
+    await message.answer(f"✅ Sent to <b>{esc(recipient_name)}</b> as office record <b>#{item_id}</b>.")  # noqa: E501
+    await _safe_notify(message.bot, recipient_telegram, f"📥 <b>NEW OFFICE MESSAGE #{item_id}</b>\nFrom: <b>{esc(message.from_user.full_name)}</b> · {esc(category)}\n\n{esc(body)}\n\nOpen /inbox to respond.")  # noqa: E501
+
+
+@router.message(Command("inbox"))
+async def office_inbox(message: Message) -> None:
+    if message.from_user is None:
+        return
+    text, kb = await _inbox_text(message.from_user.id, message.from_user.full_name)
+    await message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data == "cmd:inbox")
+async def cb_office_inbox(cq: CallbackQuery) -> None:
+    await cq.answer()
+    text, kb = await _inbox_text(cq.from_user.id, cq.from_user.full_name)
+    await cq.message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("cmd:reply:"))
+async def correspondence_reply_start(cq: CallbackQuery, state: FSMContext) -> None:
+    await cq.answer()
+    item_id = int(cq.data.rsplit(":", 1)[1])
+    async with session_scope() as s:
+        person, _ = await resolve_person(s, cq.from_user.id, cq.from_user.full_name)
+        item = await command_acknowledge_correspondence(s, person=person, item_id=item_id)
+    if item is None:
+        await cq.message.answer("That message isn't in your inbox.")
+        return
+    await state.set_state(ReplyManagement.body)
+    await state.update_data(reply_to=item_id, recipient_id=item.sender_person_id)
+    await cq.message.answer(f"Reply to office message #{item_id}:")
+
+
+@router.message(ReplyManagement.body, F.text & ~F.text.startswith("/"))
+async def correspondence_reply_body(message: Message, state: FSMContext) -> None:
+    if message.from_user is None:
+        return
+    data = await state.get_data()
+    recipient_telegram: int | None = None
+    async with session_scope() as s:
+        sender, _ = await resolve_person(s, message.from_user.id, message.from_user.full_name)
+        item = await command_create_correspondence(s, sender=sender, recipient_id=int(data["recipient_id"]), category="reply", body=message.text or "", parent_id=int(data["reply_to"]))  # noqa: E501
+        recipient = await s.get(Person, item.recipient_person_id)
+        recipient_telegram = recipient.telegram_id if recipient else None
+        item_id, body = item.id, item.body
+    await state.clear()
+    await message.answer(f"↩ Reply recorded as <b>#{item_id}</b>.")
+    await _safe_notify(message.bot, recipient_telegram, f"💬 <b>MANAGEMENT RESPONSE #{item_id}</b>\nFrom: <b>{esc(message.from_user.full_name)}</b>\n\n{esc(body)}\n\nOpen /inbox to continue the thread.")  # noqa: E501
+
+
+@router.callback_query(F.data.startswith("cmd:resolve:"))
+async def correspondence_resolve(cq: CallbackQuery) -> None:
+    await cq.answer()
+    item_id = int(cq.data.rsplit(":", 1)[1])
+    async with session_scope() as s:
+        person, _ = await resolve_person(s, cq.from_user.id, cq.from_user.full_name)
+        item = await command_resolve_correspondence(s, person=person, item_id=item_id)
+    await cq.message.answer("✓ Office message resolved." if item else "That message isn't in your inbox.")  # noqa: E501
+
+
+@router.callback_query(F.data == "cb:desk")
+async def cb_desk(cq: CallbackQuery) -> None:
+    await cq.answer()
+    text, kb = await _desk_text(cq.from_user.id, cq.from_user.full_name)
+    await cq.message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data == "cb:home")
+async def cb_command_home(cq: CallbackQuery) -> None:
+    await cq.answer()
+    text, kb = await _office(cq.from_user.id, cq.from_user.full_name)
+    await _edit_or_send(cq, text, kb)
+
+
 # ── Inline command-center buttons ────────────────────────────────────────────
 
 
@@ -1068,6 +1457,10 @@ _MENU: list[BotCommand] = [
     BotCommand(command="menu", description="🏠 Home — your command center"),
     BotCommand(command="checkin", description="🏢 Check in for today"),
     BotCommand(command="myday", description="📅 Your priorities & Daily Close"),
+    BotCommand(command="desk", description="🗂 Your assignments & office inbox"),
+    BotCommand(command="assign", description="Management: assign work"),
+    BotCommand(command="report", description="📤 Send report/concern to management"),
+    BotCommand(command="inbox", description="📥 Your office correspondence"),
     BotCommand(command="plan", description="✍️ Set today's priorities"),
     BotCommand(command="close", description="🌙 Close your day"),
     BotCommand(command="join", description="🔗 Link your staff account"),
